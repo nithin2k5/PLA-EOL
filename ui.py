@@ -459,7 +459,9 @@ def _normalise(widget_class, options):
         options.setdefault('highlightthickness', 1)
         options.setdefault('highlightbackground', BORDER)
         options.setdefault('highlightcolor', ACCENT)
-        options.setdefault('insertbackground', TEXT)
+        # A listbox has no text cursor, and Tk refuses the option outright.
+        if name != 'Listbox':
+            options.setdefault('insertbackground', TEXT)
 
     # A disabled or readonly Entry ignores `bg` entirely and paints itself in
     # a system light grey, which on a dark panel reads as a blank white slab.
