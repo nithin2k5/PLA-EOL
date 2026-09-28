@@ -3,6 +3,10 @@
 # Image Processing
 Pillow>=9.0.0
 
+# Vision inspection (template matching against a webcam)
+opencv-python>=4.8.0
+numpy>=1.24.0
+
 # Rounded, modern-looking widgets for the sidebar and Test console
 customtkinter>=5.2.0
 

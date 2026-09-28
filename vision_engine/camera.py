@@ -168,3 +168,23 @@ def grab(index: int, width: int = 640, height: int = 480,
         return stream.read(timeout=timeout)
     finally:
         stream.release()
+
+
+def probe(max_index: int = 5) -> list:
+    """Device indexes below `max_index` that open, for picking a camera.
+
+    An index that already has a live stream is reported without being
+    opened again: DirectShow allows only one capture per device.
+    """
+    found = []
+    for index in range(max_index):
+        if is_live(index):
+            found.append(index)
+            continue
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        try:
+            if cap.isOpened():
+                found.append(index)
+        finally:
+            cap.release()
+    return found
