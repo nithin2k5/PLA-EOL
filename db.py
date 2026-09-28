@@ -207,29 +207,6 @@ SCHEMA = [
             KEY idx_operator_log_datetime (OL_DATETIME)
         )
     """),
-    # Vision settings and the camera choice, one row per setting.
-    ("TBL_VISION_SETTINGS", """
-        CREATE TABLE IF NOT EXISTS TBL_VISION_SETTINGS (
-            VS_KEY VARCHAR(100) PRIMARY KEY,
-            VS_VALUE VARCHAR(500) NOT NULL,
-            VS_MODIFIED_DATE DATETIME DEFAULT CURRENT_TIMESTAMP
-                ON UPDATE CURRENT_TIMESTAMP
-        )
-    """),
-    # One taught part per row. VM_MODEL is the part's templates as a
-    # compressed NumPy archive; the other columns repeat what is inside it
-    # so the parts can be listed without unpacking every model.
-    ("TBL_VISION_MODEL", """
-        CREATE TABLE IF NOT EXISTS TBL_VISION_MODEL (
-            VM_PART_NUMBER VARCHAR(255) PRIMARY KEY,
-            VM_MODEL LONGBLOB NOT NULL,
-            VM_THRESHOLD DOUBLE NOT NULL,
-            VM_REFERENCES INT NOT NULL,
-            VM_CREATED DATETIME NOT NULL,
-            VM_MODIFIED_DATE DATETIME DEFAULT CURRENT_TIMESTAMP
-                ON UPDATE CURRENT_TIMESTAMP
-        )
-    """),
 ]
 
 
