@@ -1,881 +1,581 @@
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
-from PIL import Image, ImageTk
 import mysql.connector
-from tkcalendar import DateEntry
+import customtkinter as ctk
 import os
 import json
 from datetime import datetime, timedelta
 import csv
-import shutil
 import auth
 import config
 import db
 import ui
 
-class AdminConsole:
-    # A stored password is a hash, so it is never shown. This stands in
-    # its place and means "leave the password as it is".
-    KEEP_PASSWORD = "(unchanged - type to replace)"
 
+# The employee form: (field, label). Every one of them is required.
+FIELDS = (
+    ("name", "FULL NAME"),
+    ("number", "EMPLOYEE NUMBER"),
+    ("password", "PASSWORD"),
+    ("mobile", "MOBILE NUMBER"),
+    ("designation", "DESIGNATION"),
+    ("department", "DEPARTMENT"),
+)
+
+# Employee list columns: heading, width, whether it takes spare width.
+LIST_COLUMNS = (
+    ("FULL NAME", 170, True),
+    ("EMPLOYEE NO", 150, False),
+    ("DESIGNATION", 140, False),
+    ("DEPARTMENT", 140, False),
+    ("MOBILE", 125, False),
+    ("STATUS", 90, False),
+)
+
+
+class AdminConsole:
     def __init__(self, root):
         self.root = root
         ui.apply(root)
-        
-        # Initialize backup paths and machine ID from environment variables
+
+        # Initialize backup paths and machine ID from the settings file
         self.backup_paths = {
             'primary': config.get('PRIMARY_BACKUP_PATH', ''),
             'secondary': config.get('SECONDARY_BACKUP_PATH', '')
         }
-        self.machine_id = config.get('MACHINE_ID', '')  # Get machine ID from settings
-        
-        # Set title with machine ID
+        self.machine_id = config.get('MACHINE_ID', '')
+        self.set_title()
+
+        # Database configuration
+        self.db_config = db.get_config()
+
+        # Initialize database
+        self.init_database()
+
+        self.root.configure(bg=ui.APP_BG)
+
+        # The employee number of the record in the form, or None while the
+        # form is for a new employee.
+        self.editing = None
+        # Every employee as loaded, for the list's search box to filter.
+        self.employees = []
+
+        self.setup_ui()
+        self.load_records()
+        self.clear_entries()
+
+    def set_title(self):
         title = "ADMIN CONSOLE"
         if self.machine_id:
             title += f" - Machine ID: {self.machine_id}"
         self.root.title(title)
-        
-        # Database configuration
-        self.db_config = db.get_config()
-        
-        # Initialize database
-        self.init_database()
-        
-        # Configure the main background color
-        self.root.configure(bg=ui.APP_BG)
-        
-        # Create and setup the UI
-        self.setup_ui()
-        
-        # Load existing records
-        self.load_records()
 
     def init_database(self):
         """Create the database and any missing tables."""
         if not db.init_database():
             messagebox.showerror("Database Error", "Failed to initialize database")
 
-    def load_records(self):
-        """Load existing records into the treeview"""
-        try:
-            # Clear existing items
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, DESIGNATION, 
-                       DEPARTMENT, MOBILE_NUMBER, IS_ACTIVE 
-                FROM EMPLOYEE_INFO 
-                ORDER BY ID DESC
-            """)
-            
-            for i, row in enumerate(cursor.fetchall(), 1):
-                status = "Active" if row[5] else "Inactive"
-                self.tree.insert('', 'end', values=(i,) + row[:-1] + (status,))
-            
-            cursor.close()
-            conn.close()
-            
-        except mysql.connector.Error as err:
-            messagebox.showerror("Database Error", f"Failed to load records: {err}")
-
-    def add_record(self):
-        """Add a new employee record"""
-        try:
-            # Get values from entries
-            values = {}
-            for field, entry in self.entries.items():
-                value = entry.get().strip()
-                placeholder = self.get_placeholder(field)
-                # Check if value is empty or is placeholder text
-                if not value or value == placeholder:
-                    messagebox.showwarning("Warning", f"Please enter {field.lower().replace(':', '').strip()}")
-                    entry.focus_set()  # Set focus to the empty field
-                    return
-                values[field] = value
-            
-            # A new employee needs a real password, not the "unchanged" marker
-            # left behind by selecting an existing record.
-            if values["PASSWORD :"] == self.KEEP_PASSWORD:
-                messagebox.showwarning("Warning", "Please enter a password for the new employee")
-                self.entries["PASSWORD :"].focus_set()
-                return
-            
-            # Add machine ID to the record
-            machine_id = self.machine_id_var.get().strip()
-            if not machine_id:
-                messagebox.showwarning("Warning", "Please set Machine ID first")
-                return
-            
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            query = """
-                INSERT INTO EMPLOYEE_INFO (
-                    EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, PASSWORD,
-                    DESIGNATION, DEPARTMENT, MOBILE_NUMBER, MACHINE_ID, IS_ACTIVE
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-            """
-            
-            cursor.execute(query, (
-                values["EMPLOYEE FULL NAME :"],
-                values["EMPLOYEE NUMBER :"],
-                auth.compute_hash(values["PASSWORD :"]),
-                values["DESIGNATION :"],
-                values["DEPARTMENT :"],
-                values["MOBILE NUMBER :"],
-                machine_id
-            ))
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
-            
-            messagebox.showinfo("Success", "Employee added successfully!")
-            self.load_records()
-            self.clear_entries()
-            
-        except mysql.connector.Error as err:
-            if err.errno == 1062:  # Duplicate entry error
-                messagebox.showerror("Error", "Employee number already exists!")
-            else:
-                messagebox.showerror("Database Error", f"Failed to add employee: {err}")
-
-    def show_password_placeholder(self):
-        """Mark the password box as carrying the stored password, not a new one."""
-        entry = self.entries.get("PASSWORD :")
-        if entry is None:
-            return
-
-        entry.delete(0, tk.END)
-        entry.insert(0, self.KEEP_PASSWORD)
-        entry.config(fg='#999999')
-
-        # Clear the marker as soon as the operator starts typing a new one.
-        def clear_marker(event, entry=entry):
-            if entry.get() == self.KEEP_PASSWORD:
-                entry.delete(0, tk.END)
-                entry.config(fg='black')
-
-        def restore_marker(event, entry=entry):
-            if not entry.get():
-                entry.insert(0, self.KEEP_PASSWORD)
-                entry.config(fg='#999999')
-
-        entry.bind('<FocusIn>', clear_marker)
-        entry.bind('<FocusOut>', restore_marker)
-
-    def get_placeholder(self, field):
-        """Get placeholder text for a field"""
-        placeholders = {
-            "EMPLOYEE FULL NAME :": "Enter Full Name",
-            "EMPLOYEE NUMBER :": "Enter Employee Number",
-            "PASSWORD :": "Enter Password",
-            "DESIGNATION :": "Enter Designation",
-            "DEPARTMENT :": "Enter Department",
-            "MOBILE NUMBER :": "Enter Mobile Number"
-        }
-        return placeholders.get(field, "")
-
-    def clear_entries(self):
-        """Clear all entry fields and reset to default state with placeholders"""
-        default_values = {
-            "EMPLOYEE FULL NAME :": "Enter Full Name",
-            "EMPLOYEE NUMBER :": "Enter Employee Number",
-            "PASSWORD :": "Enter Password",
-            "DESIGNATION :": "Enter Designation",
-            "DEPARTMENT :": "Enter Department",
-            "MOBILE NUMBER :": "Enter Mobile Number"
-        }
-        
-        for field, entry in self.entries.items():
-            entry.delete(0, tk.END)
-            entry.insert(0, default_values.get(field, ""))
-            entry.config(fg='#999999')  # Gray color for placeholder
-            
-            # Rebind placeholder events
-            placeholder = default_values.get(field, "")
-            entry.bind('<FocusIn>', lambda e, entry=entry, placeholder=placeholder: 
-                self.on_entry_focus_in(entry, placeholder))
-            entry.bind('<FocusOut>', lambda e, entry=entry, placeholder=placeholder: 
-                self.on_entry_focus_out(entry, placeholder))
-        
-        # Clear treeview selection
-        if hasattr(self, 'tree'):
-            self.tree.selection_remove(self.tree.selection())
-
-    def on_entry_focus_in(self, entry, placeholder):
-        """Handle entry field focus in"""
-        if entry.get() == placeholder:
-            entry.delete(0, tk.END)
-            entry.config(fg='black')
-
-    def on_entry_focus_out(self, entry, placeholder):
-        """Handle entry field focus out"""
-        if not entry.get():
-            entry.insert(0, placeholder)
-            entry.config(fg='#999999')  # Gray color for placeholder
-
-    def delete_record(self):
-        """Delete selected employee record"""
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a record to delete!")
-            return
-        
-        if messagebox.askyesno("Confirm", "Are you sure you want to delete this record?"):
-            try:
-                item = self.tree.item(selected[0])
-                emp_number = item['values'][2]  # Employee number is at index 2
-                
-                conn = mysql.connector.connect(**self.db_config)
-                cursor = conn.cursor()
-                
-                cursor.execute("DELETE FROM EMPLOYEE_INFO WHERE EMPLOYEE_NUMBER = %s", (emp_number,))
-                conn.commit()
-                cursor.close()
-                conn.close()
-                
-                messagebox.showinfo("Success", "Record deleted successfully!")
-                self.load_records()
-                self.clear_entries()  # Clear entries after deletion
-                
-            except mysql.connector.Error as err:
-                messagebox.showerror("Database Error", f"Failed to delete record: {err}")
-
-    def save_record(self):
-        """Save/Update employee record"""
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a record to save!")
-            return
-        
-        try:
-            # Get and validate values from entries
-            values = {}
-            for field, entry in self.entries.items():
-                value = entry.get().strip()
-                placeholder = self.get_placeholder(field)
-                # Check if value is empty or is placeholder text
-                if not value or value == placeholder:
-                    messagebox.showwarning("Warning", f"Please enter {field.lower().replace(':', '').strip()}")
-                    entry.focus_set()
-                    return
-                values[field] = value
-            
-            item = self.tree.item(selected[0])
-            emp_number = item['values'][2]  # Original employee number
-            
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            
-            # The password column is only touched when a new one was typed.
-            typed_password = values["PASSWORD :"]
-            replace_password = typed_password != self.KEEP_PASSWORD
-            
-            if replace_password:
-                query = """
-                    UPDATE EMPLOYEE_INFO SET 
-                        EMPLOYEE_FULL_NAME = %s,
-                        EMPLOYEE_NUMBER = %s,
-                        PASSWORD = %s,
-                        DESIGNATION = %s,
-                        DEPARTMENT = %s,
-                        MOBILE_NUMBER = %s
-                    WHERE EMPLOYEE_NUMBER = %s
-                """
-                parameters = (
-                    values["EMPLOYEE FULL NAME :"],
-                    values["EMPLOYEE NUMBER :"],
-                    auth.compute_hash(typed_password),
-                    values["DESIGNATION :"],
-                    values["DEPARTMENT :"],
-                    values["MOBILE NUMBER :"],
-                    emp_number
-                )
-            else:
-                query = """
-                    UPDATE EMPLOYEE_INFO SET 
-                        EMPLOYEE_FULL_NAME = %s,
-                        EMPLOYEE_NUMBER = %s,
-                        DESIGNATION = %s,
-                        DEPARTMENT = %s,
-                        MOBILE_NUMBER = %s
-                    WHERE EMPLOYEE_NUMBER = %s
-                """
-                parameters = (
-                    values["EMPLOYEE FULL NAME :"],
-                    values["EMPLOYEE NUMBER :"],
-                    values["DESIGNATION :"],
-                    values["DEPARTMENT :"],
-                    values["MOBILE NUMBER :"],
-                    emp_number
-                )
-            
-            cursor.execute(query, parameters)
-            
-            conn.commit()
-            cursor.close()
-            conn.close()
-            
-            messagebox.showinfo("Success", "Record updated successfully!")
-            self.load_records()
-            self.clear_entries()
-            
-        except mysql.connector.Error as err:
-            messagebox.showerror("Database Error", f"Failed to update record: {err}")
-
-    def edit_record(self):
-        """Load selected record into entry fields"""
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a record to edit!")
-            return
-        
-        try:
-            # Get values from selected item
-            item = self.tree.item(selected[0])
-            values = item['values']
-            emp_number = values[2]  # Employee number
-            
-            # Fetch full record including password from database
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, 
-                       DESIGNATION, DEPARTMENT, MOBILE_NUMBER
-                FROM EMPLOYEE_INFO
-                WHERE EMPLOYEE_NUMBER = %s
-            """, (emp_number,))
-            
-            record = cursor.fetchone()
-            cursor.close()
-            conn.close()
-            
-            if not record:
-                messagebox.showerror("Error", "Could not load employee record")
-                return
-            
-            # Clear all entries first
-            for entry in self.entries.values():
-                entry.delete(0, tk.END)
-                entry.config(fg='black')
-                # Unbind placeholder events
-                entry.unbind('<FocusIn>')
-                entry.unbind('<FocusOut>')
-            
-            # Populate entry fields with actual data
-            fields = ["EMPLOYEE FULL NAME :", "EMPLOYEE NUMBER :",
-                     "DESIGNATION :", "DEPARTMENT :", "MOBILE NUMBER :"]
-            
-            for field, value in zip(fields, record):
-                if field in self.entries:
-                    self.entries[field].delete(0, tk.END)
-                    self.entries[field].insert(0, value)
-                    self.entries[field].config(fg='black')
-            
-            self.show_password_placeholder()
-                    
-        except mysql.connector.Error as err:
-            messagebox.showerror("Database Error", f"Failed to load record: {err}")
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
 
     def setup_ui(self):
-        # Load icons with fallback text
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), "icons")
-            self.add_icon = ImageTk.PhotoImage(Image.open(os.path.join(icon_path, "add_icon.png")).resize((20, 20)))
-            self.edit_icon = ImageTk.PhotoImage(Image.open(os.path.join(icon_path, "edit_icon.png")).resize((20, 20)))
-            self.save_icon = ImageTk.PhotoImage(Image.open(os.path.join(icon_path, "save_icon.png")).resize((20, 20)))
-            self.delete_icon = ImageTk.PhotoImage(Image.open(os.path.join(icon_path, "delete_icon.png")).resize((20, 20)))
-            self.clear_icon = ImageTk.PhotoImage(Image.open(os.path.join(icon_path, "clear_icon.png")).resize((20, 20)))
-        except Exception as e:
-            print(f"Error loading icons: {e}")
-            # Set icons to None for fallback to text-only buttons
-            self.add_icon = self.edit_icon = self.save_icon = self.delete_icon = self.clear_icon = None
-
         # The pink title bar and footer every console carries
         ui.page_header(self.root, "Admin")
         ui.footer_bar(self.root)
 
-        # Main content frame, inside a scroller so nothing falls off a
-        # shorter screen.
-        self.page_scroller = ui.scrollable(self.root)
-        self.page_scroller.pack(fill=tk.BOTH, expand=True)
-        
-        content_frame = tk.Frame(self.page_scroller.body, bg=ui.SURFACE)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        body = tk.Frame(self.root, bg=ui.APP_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
+        body.grid_columnconfigure(0, weight=2, uniform='admin')
+        body.grid_columnconfigure(1, weight=3, uniform='admin')
+        body.grid_rowconfigure(0, weight=1)
 
-        # Top section container
-        top_container = tk.Frame(content_frame, bg=ui.SURFACE)
-        top_container.pack(fill=tk.X, padx=10, pady=10)
+        # The left column scrolls, so a short screen can still reach the form.
+        left = ui.scrollable(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, ui.PAD_LARGE))
+        # The form first: employees change far more often than the machine
+        # setup, which is done once.
+        self.create_employee_form(left.body)
+        self.create_machine_card(left.body)
 
-        # Left side - Entry fields (70% of width)
-        left_frame = tk.Frame(top_container, bg=ui.SURFACE)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.create_employee_list(body)
 
-        # Fields configuration
-        fields = [
-            "EMPLOYEE FULL NAME :",
-            "EMPLOYEE NUMBER :",
-            "PASSWORD :",
-            "DESIGNATION :",
-            "DEPARTMENT :",
-            "MOBILE NUMBER :"
-        ]
+    def card(self, parent, title, icon):
+        """A titled rounded card. Returns (card, frame to fill)."""
+        card = ui.ctk_card(parent)
+        header = ui.ctk_card_header(card, title, icon=icon)
+        inner = tk.Frame(card, bg=ui.SURFACE)
+        inner.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
+        card.header = header
+        return card, inner
 
-        # Create a frame for organizing entry fields in a grid layout
-        entries_frame = tk.Frame(left_frame, bg=ui.SURFACE)
-        entries_frame.pack(anchor='w', padx=20)
+    @staticmethod
+    def field_label(parent, text, row, column=0, columnspan=1):
+        tk.Label(parent, text=text, bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                 font=(ui.FONT_FAMILY, 10, 'bold'), anchor='w').grid(
+                     row=row, column=column, columnspan=columnspan,
+                     sticky='w', pady=(ui.PAD, 2))
+
+    def create_machine_card(self, parent):
+        """Machine ID, the two archive folders, and the employee backup."""
+        card, box = self.card(parent, "MACHINE", 'gear')
+        card.pack(fill=tk.X, padx=(0, ui.PAD), pady=(ui.PAD_LARGE, ui.PAD_LARGE))
+        box.grid_columnconfigure(0, weight=1)
+
+        self.field_label(box, "MACHINE ID", 0)
+        self.machine_id_var = tk.StringVar(value=self.machine_id)
+        self.machine_id_entry = tk.Entry(box, textvariable=self.machine_id_var,
+                                         font=ui.FONT_BODY)
+        self.machine_id_entry.grid(row=1, column=0, sticky='ew', ipady=3)
+        ui.ctk_button(box, "Save ID", icon='check', kind='primary', width=110,
+                      command=self.save_machine_id).grid(
+                          row=1, column=1, padx=(ui.PAD, 0))
+
+        self.path_vars = {}
+        self.path_marks = {}
+        for offset, (key, title) in enumerate((('primary', "PRIMARY ARCHIVE FOLDER"),
+                                               ('secondary', "SECONDARY ARCHIVE FOLDER"))):
+            row = 2 + offset * 2
+            self.field_label(box, title, row)
+
+            well = tk.Frame(box, bg=ui.SURFACE, highlightthickness=1,
+                            highlightbackground=ui.BORDER)
+            well.grid(row=row + 1, column=0, sticky='ew')
+            mark = tk.Label(well, bg=ui.SURFACE, font=ui.FONT_BODY_BOLD, width=2)
+            mark.pack(side=tk.LEFT, padx=(4, 0))
+            var = tk.StringVar()
+            # A label rather than an entry: the path is only ever chosen
+            # with Browse. It is cut from the left when too long, since the
+            # folder names at the end are the ones that tell two apart.
+            path = tk.Label(well, bg=ui.SURFACE, fg=ui.TEXT,
+                            font=ui.FONT_SMALL, anchor='w', width=1)
+            path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 4), ipady=4)
+            path.bind('<Button-1>', lambda e, k=key: self.browse_backup_path(k))
+            path.bind('<Configure>', lambda e, lbl=path, v=var: self.fit_path(lbl, v))
+            var.trace_add('write', lambda *a, lbl=path, v=var: self.fit_path(lbl, v))
+
+            ui.ctk_button(box, "Browse", icon='document', kind='neutral', width=110,
+                          command=lambda k=key: self.browse_backup_path(k)).grid(
+                              row=row + 1, column=1, padx=(ui.PAD, 0))
+
+            self.path_vars[key] = var
+            self.path_marks[key] = mark
+            self.show_path(key)
+
+        tk.Label(box, bg=ui.SURFACE, fg=ui.TEXT_MUTED, font=ui.FONT_SMALL,
+                 anchor='w', justify='left', wraplength=420,
+                 text="Old test results are archived to both folders. Testing "
+                      "stays disabled until the Machine ID and both folders "
+                      "are set.").grid(row=6, column=0, columnspan=2, sticky='w',
+                                       pady=(ui.PAD, 0))
+
+        ui.ctk_button(box, "Back Up Employee List", icon='download', kind='success',
+                      command=self.create_backup).grid(
+                          row=7, column=0, columnspan=2, sticky='e',
+                          pady=(ui.PAD_LARGE, 0))
+
+    @staticmethod
+    def fit_path(label, var):
+        """Show as much of the end of the path as the label has room for."""
+        text = var.get()
+        font = tkfont.Font(font=label.cget('font'))
+        room = label.winfo_width() - 8
+        if room > 20 and font.measure(text) > room:
+            while text and font.measure("…" + text) > room:
+                text = text[1:]
+            text = "…" + text
+        label.config(text=text)
+
+    def show_path(self, key):
+        """Show a folder, marked by whether it is there."""
+        path = self.backup_paths.get(key, '')
+        mark = self.path_marks[key]
+        if not path:
+            self.path_vars[key].set("Not set - press Browse")
+            mark.config(text="!", fg=ui.WARNING_HOVER)
+        elif os.path.isdir(path):
+            self.path_vars[key].set(path)
+            mark.config(text="✓", fg=ui.SUCCESS)
+        else:
+            self.path_vars[key].set(path + "   (folder not found)")
+            mark.config(text="✕", fg=ui.DANGER)
+
+    def create_employee_form(self, parent):
+        card, box = self.card(parent, "EMPLOYEE", 'shield')
+        card.pack(fill=tk.X, padx=(0, ui.PAD))
+        box.grid_columnconfigure(0, weight=1, uniform='form')
+        box.grid_columnconfigure(1, weight=1, uniform='form')
+
+        # Whether the form is adding someone or changing a record.
+        self.mode_label = ctk.CTkLabel(card.header, text="", fg_color=ui.NAVY,
+                                       text_color=ui.ACCENT_SOFT, font=ui.FONT_SMALL)
+        self.mode_label.pack(side='right', padx=ui.PAD_LARGE)
 
         self.entries = {}
-        placeholders = {
-            "EMPLOYEE FULL NAME :": "Enter Full Name",
-            "EMPLOYEE NUMBER :": "Enter Employee Number",
-            "PASSWORD :": "Enter Password",
-            "DESIGNATION :": "Enter Designation",
-            "DEPARTMENT :": "Enter Department",
-            "MOBILE NUMBER :": "Enter Mobile Number"
-        }
-        
-        for i, field in enumerate(fields):
-            # Create frame for each row
-            row_frame = tk.Frame(entries_frame, bg=ui.SURFACE)
-            row_frame.pack(fill=tk.X, pady=5)
-            
-            # Label with fixed width
-            label = tk.Label(
-                row_frame, 
-                text=field,
-                bg=ui.SURFACE,
-                fg='black',
-                font=(ui.FONT_FAMILY, 10, 'bold'),
-                width=20,
-                anchor='e'
-            )
-            label.pack(side=tk.LEFT, padx=5)
-            
-            # Entry with specified width
-            entry = tk.Entry(
-                row_frame,
-                font=(ui.FONT_FAMILY, 10),
-                width=40,
-                bg=ui.SURFACE,
-                fg='#999999',  # Start with gray placeholder color
-                relief='solid',
-                bd=1,
-                insertbackground=ui.TEXT
-            )
-            entry.pack(side=tk.LEFT, padx=5)
-            self.entries[field] = entry
-            
-            # Insert placeholder text
-            placeholder = placeholders.get(field, "")
-            entry.insert(0, placeholder)
-            
-            # Bind focus events for placeholder behavior
-            entry.bind('<FocusIn>', lambda e, entry=entry, placeholder=placeholder: 
-                self.on_entry_focus_in(entry, placeholder))
-            entry.bind('<FocusOut>', lambda e, entry=entry, placeholder=placeholder: 
-                self.on_entry_focus_out(entry, placeholder))
+        for index, (key, title) in enumerate(FIELDS):
+            row, column = divmod(index, 2)
+            self.field_label(box, title, row * 2, column)
+            entry = tk.Entry(box, font=ui.FONT_BODY,
+                             show="•" if key == 'password' else "")
+            entry.grid(row=row * 2 + 1, column=column, sticky='ew', ipady=3,
+                       padx=(0, ui.PAD) if column == 0 else (ui.PAD, 0))
+            self.entries[key] = entry
 
-        # Add Backup Path Selection frames after Machine ID
-        self.create_backup_path_section(entries_frame)
+        self.password_hint = tk.Label(box, text="", bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                                      font=ui.FONT_SMALL, anchor='w')
+        self.password_hint.grid(row=6, column=0, columnspan=2, sticky='w',
+                                pady=(ui.PAD, 0))
 
-        # Right side - Buttons frame (30% of width)
-        right_frame = tk.Frame(top_container, bg=ui.SURFACE)
-        right_frame.pack(side=tk.RIGHT, padx=20)
+        self.active_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(box, text="Active - can sign in to Settings, Vision and Admin",
+                        variable=self.active_var).grid(
+                            row=7, column=0, columnspan=2, sticky='w',
+                            pady=(ui.PAD, 0))
 
-        # Configure treeview style
-        style = ttk.Style()
-        style.configure(
-            "Custom.Treeview",
-            background=ui.SURFACE,
-            foreground=ui.TEXT,
-            fieldbackground=ui.SURFACE,  # Color of empty rows
-            rowheight=26,
-            font=ui.FONT_BODY
-        )
-        
-        style.configure(
-            "Custom.Treeview.Heading",
-            background=ui.SKY,
-            foreground=ui.TEXT_ON_ACCENT,
-            relief="flat",
-            font=ui.FONT_BODY_BOLD
-        )
-        style.map("Custom.Treeview.Heading", background=[('active', ui.ACCENT_HOVER)])
+        actions = tk.Frame(box, bg=ui.SURFACE)
+        actions.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(ui.PAD_LARGE, 0))
 
-        # Map selected row colors
-        style.map('Custom.Treeview',
-            background=[('selected', ui.ACCENT_SOFT)],
-            foreground=[('selected', ui.TEXT)]
-        )
+        self.add_button = ui.ctk_button(actions, "Add Employee", icon='check',
+                                        kind='success', width=150,
+                                        command=self.add_record)
+        self.save_button = ui.ctk_button(actions, "Save Changes", icon='check',
+                                         kind='primary', width=150,
+                                         command=self.save_record)
+        self.delete_button = ui.ctk_button(actions, "Delete", icon='alert',
+                                           kind='danger', width=110,
+                                           command=self.delete_record)
+        self.clear_button = ui.ctk_button(actions, "New / Clear", icon='refresh',
+                                          kind='neutral', width=130,
+                                          command=self.clear_entries)
+        self.clear_button.pack(side=tk.RIGHT)
 
-        # Updated buttons configuration with distinct colors
-        buttons = [
-            ("ADD", ui.SUCCESS, self.add_record, self.add_icon),
-            ("EDIT", ui.WARNING, self.edit_record, self.edit_icon),
-            ("SAVE", ui.SKY, self.save_record, self.save_icon),
-            ("DELETE", ui.DANGER, self.delete_record, self.delete_icon),
-            ("CLEAR", ui.SILVER, self.clear_entries, self.clear_icon)
-        ]
+        self.banner = ui.StatusBanner(box)
+        self.banner.grid(row=9, column=0, columnspan=2, sticky='ew',
+                         pady=(ui.PAD_LARGE, 0))
 
-        # Create buttons vertically with spacing and updated hover colors
-        for text, color, command, icon in buttons:
-            btn_frame = tk.Frame(right_frame, bg=ui.SURFACE)
-            btn_frame.pack(pady=5)
-            
-            btn = tk.Button(
-                btn_frame,
-                text=" " + text,
-                command=command,
-                bg=color,
-                fg=ui.readable_on(color),
-                font=(ui.FONT_FAMILY, 11, 'bold'),
-                width=15,
-                height=2,
-                relief='raised',
-                bd=2,
-                cursor='hand2',
-                compound='left'
-            )
-            if icon:
-                btn.config(image=icon)
-            btn.pack()
-            
-            # Custom hover colors for each button
-            hover_colors = {
-                ui.SUCCESS: ui.SUCCESS_HOVER,
-                ui.WARNING: ui.WARNING_HOVER,
-                ui.SKY: ui.ACCENT_HOVER,
-                ui.DANGER: ui.DANGER_HOVER,
-                ui.SILVER: ui.BORDER,
-            }
-            
-            btn.bind('<Enter>', lambda e, b=btn, c=hover_colors[color]: b.configure(bg=c))
-            btn.bind('<Leave>', lambda e, b=btn, c=color: b.configure(bg=c))
+    def create_employee_list(self, parent):
+        card, box = self.card(parent, "EMPLOYEES", 'list')
+        card.grid(row=0, column=1, sticky="nsew")
 
-        # Treeview section
-        tree_frame = tk.Frame(content_frame, bg=ui.SURFACE)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(20, 10))
+        self.count_label = ctk.CTkLabel(card.header, text="", fg_color=ui.NAVY,
+                                        text_color=ui.ACCENT_SOFT, font=ui.FONT_SMALL)
+        self.count_label.pack(side='right', padx=ui.PAD_LARGE)
 
-        # Configure columns
-        columns = ('NO', 'EMPLOYEE FULL NAME', 'EMPLOYEE NUMBER', 
-                  'DESIGNATION', 'DEPARTMENT', 'MOBILE NUMBER', 'STATUS')
-        
-        self.tree = ttk.Treeview(
-            tree_frame, 
-            columns=columns, 
-            show='headings', 
-            height=15,
-            style="Custom.Treeview"
-        )
-        
-        # Column widths
-        widths = {
-            'NO': 50,
-            'EMPLOYEE FULL NAME': 200,
-            'EMPLOYEE NUMBER': 150,
-            'DESIGNATION': 150,
-            'DEPARTMENT': 150,
-            'MOBILE NUMBER': 150,
-            'STATUS': 100
-        }
-        
-        # Configure columns
-        for col in columns:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=widths[col], anchor='center')
+        search_row = tk.Frame(box, bg=ui.SURFACE)
+        search_row.pack(fill=tk.X, pady=(0, ui.PAD))
+        tk.Label(search_row, text="SEARCH", bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                 font=(ui.FONT_FAMILY, 10, 'bold')).pack(side=tk.LEFT, padx=(0, ui.PAD))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add('write', lambda *a: self.show_employees())
+        tk.Entry(search_row, textvariable=self.search_var, font=ui.FONT_BODY).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
 
-        # Add scrollbar
+        tree_frame = tk.Frame(box, bg=ui.SURFACE)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        columns = [heading for heading, _, _ in LIST_COLUMNS]
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings',
+                                 selectmode='browse')
+        for heading, width, stretch in LIST_COLUMNS:
+            self.tree.heading(heading, text=heading)
+            self.tree.column(heading, width=width, minwidth=width, stretch=stretch,
+                             anchor='w' if stretch else 'center')
+        self.tree.tag_configure('inactive', foreground=ui.TEXT_MUTED)
+
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        
-        # Pack treeview and scrollbar
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sideways = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=sideways.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        sideways.grid(row=1, column=0, sticky='ew')
 
-        # Bind treeview selection event
+        tk.Label(box, bg=ui.SURFACE, fg=ui.TEXT_MUTED, font=ui.FONT_SMALL, anchor='w',
+                 text="Click an employee to change or delete them.").pack(
+                     fill=tk.X, pady=(ui.PAD, 0))
+
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
 
-    def lighten_color(self, color):
-        """Helper function for hover effects - Not used anymore as we have specific hover colors"""
-        pass  # This function is kept for compatibility but no longer needed
+    # ------------------------------------------------------------------
+    # Employee list
+    # ------------------------------------------------------------------
 
-    def on_tree_select(self, event):
-        """Handle treeview selection with improved entry handling"""
-        selected = self.tree.selection()
-        if selected:
-            try:
-                item = self.tree.item(selected[0])
-                values = item['values']
-                emp_number = values[2]  # Employee number
-                
-                # Fetch full record including password from database
-                conn = mysql.connector.connect(**self.db_config)
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, 
-                           DESIGNATION, DEPARTMENT, MOBILE_NUMBER
-                    FROM EMPLOYEE_INFO
-                    WHERE EMPLOYEE_NUMBER = %s
-                """, (emp_number,))
-                
-                record = cursor.fetchone()
-                cursor.close()
-                conn.close()
-                
-                if not record:
-                    return
-                
-                # Clear entries without setting placeholders
-                for entry in self.entries.values():
-                    entry.delete(0, tk.END)
-                    entry.config(fg='black')  # Set text color to black for actual data
-                    # Unbind placeholder events temporarily
-                    entry.unbind('<FocusIn>')
-                    entry.unbind('<FocusOut>')
-                
-                # Populate entries with selected record data
-                fields = ["EMPLOYEE FULL NAME :", "EMPLOYEE NUMBER :",
-                         "DESIGNATION :", "DEPARTMENT :", "MOBILE NUMBER :"]
-                
-                for field, value in zip(fields, record):
-                    if field in self.entries:
-                        self.entries[field].delete(0, tk.END)
-                        self.entries[field].insert(0, value)
-                        self.entries[field].config(fg='black')
-                
-                self.show_password_placeholder()
-                        
-            except mysql.connector.Error as err:
-                print(f"Error loading record: {err}")
-
-    def add_image_to_frame(self, image_path):
+    def load_records(self):
+        """Load every employee, then show those matching the search box."""
         try:
-            # Open and resize image
-            image = Image.open(image_path)
-            image = image.resize((140, 170), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(image)
-            
-            # Create label and display image
-            image_label = tk.Label(self.image_frame, image=photo, bg=ui.SURFACE)
-            image_label.image = photo  # Keep a reference
-            image_label.pack(fill=tk.BOTH, expand=True)
-            
-        except Exception as e:
-            print(f"Error loading image: {e}")
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, DESIGNATION,
+                       DEPARTMENT, MOBILE_NUMBER, IS_ACTIVE
+                FROM EMPLOYEE_INFO
+                ORDER BY ID DESC
+            """)
+            self.employees = cursor.fetchall()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as err:
+            self.employees = []
+            messagebox.showerror("Database Error", f"Failed to load records: {err}")
+        self.show_employees()
 
-    def create_backup_path_section(self, parent):
-        """Create backup path section with machine ID"""
-        # Create a frame with a border and title
-        backup_frame = ttk.LabelFrame(parent, text="Backup Configuration", padding=(10, 5))
-        backup_frame.pack(fill=tk.X, pady=10, padx=5)
-        
-        # Machine ID
-        row_frame = tk.Frame(backup_frame, bg=ui.SURFACE)
-        row_frame.pack(fill=tk.X, pady=5)
-        
-        label = tk.Label(
-            row_frame, 
-            text="MACHINE ID :",
-            bg=ui.SURFACE,
-            fg='black',
-            font=(ui.FONT_FAMILY, 10, 'bold'),
-            width=24,
-            anchor='e'
-        )
-        label.pack(side=tk.LEFT, padx=5)
-        
-        # Text entry for Machine ID
-        self.machine_id_var = tk.StringVar(value=self.machine_id)
-        self.machine_id_entry = tk.Entry(
-            row_frame,
-            textvariable=self.machine_id_var,
-            width=40,
-            bg=ui.SURFACE,
-            fg='black',
-            font=(ui.FONT_FAMILY, 9)
-        )
-        self.machine_id_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Save Machine ID button
-        save_machine_id_btn = tk.Button(
-            row_frame,
-            text="Save ID",
-            command=self.save_machine_id,
-            bg=ui.SKY,
-            fg=ui.TEXT_ON_ACCENT,
-            font=(ui.FONT_FAMILY, 10, 'bold'),
-            relief='raised',
-            bd=2,
-            padx=10
-        )
-        save_machine_id_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Add hover effect for save button
-        save_machine_id_btn.bind('<Enter>', lambda e: save_machine_id_btn.configure(bg=ui.ACCENT_HOVER))
-        save_machine_id_btn.bind('<Leave>', lambda e: save_machine_id_btn.configure(bg=ui.SKY))
+    def show_employees(self):
+        wanted = self.search_var.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for name, number, designation, department, mobile, active in self.employees:
+            values = [name, number, designation, department, mobile]
+            if wanted and not any(wanted in str(v or '').lower() for v in values):
+                continue
+            # The employee number is the row's id, so it is read back exactly
+            # as stored - a list value would turn "0123" into the number 123.
+            self.tree.insert('', 'end', iid=number,
+                             values=[v or '' for v in values] +
+                                    ["Active" if active else "Inactive"],
+                             tags=() if active else ('inactive',))
+            shown += 1
 
-        # Primary Backup Path
-        row_frame = tk.Frame(backup_frame, bg=ui.SURFACE)
-        row_frame.pack(fill=tk.X, pady=5)
-        
-        label = tk.Label(
-            row_frame, 
-            text="PRIMARY BACKUP PATH :",
-            bg=ui.SURFACE,
-            fg='black',
-            font=(ui.FONT_FAMILY, 10, 'bold'),
-            width=24,
-            anchor='e'
-        )
-        label.pack(side=tk.LEFT, padx=5)
-        
-        # Text entry for primary path
-        primary_default = self.backup_paths.get('primary', '')
-        if not primary_default or primary_default == '':
-            primary_default = 'Click to select primary backup path...'
-        self.primary_path_var = tk.StringVar(value=primary_default)
-        self.primary_path_entry = tk.Entry(
-            row_frame,
-            textvariable=self.primary_path_var,
-            width=40,
-            bg='#f0f0f0',  # Light gray background
-            fg='#666666' if primary_default.startswith('Click') else '#000000',  # Gray for placeholder, black for path
-            font=(ui.FONT_FAMILY, 9),
-            state='readonly'  # Make read-only, only clickable
-        )
-        self.primary_path_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Bind click event to primary path entry
-        self.primary_path_entry.bind('<Button-1>', lambda e: self.browse_backup_path('primary'))
-        
-        # Secondary Backup Path
-        row_frame = tk.Frame(backup_frame, bg=ui.SURFACE)
-        row_frame.pack(fill=tk.X, pady=5)
-        
-        label = tk.Label(
-            row_frame, 
-            text="SECONDARY BACKUP PATH :",
-            bg=ui.SURFACE,
-            fg='black',
-            font=(ui.FONT_FAMILY, 10, 'bold'),
-            width=24,
-            anchor='e'
-        )
-        label.pack(side=tk.LEFT, padx=5)
-        
-        # Text entry for secondary path
-        secondary_default = self.backup_paths.get('secondary', '')
-        if not secondary_default or secondary_default == '':
-            secondary_default = 'Click to select secondary backup path...'
-        self.secondary_path_var = tk.StringVar(value=secondary_default)
-        self.secondary_path_entry = tk.Entry(
-            row_frame,
-            textvariable=self.secondary_path_var,
-            width=40,
-            bg='#f0f0f0',  # Light gray background
-            fg='#666666' if secondary_default.startswith('Click') else '#000000',  # Gray for placeholder, black for path
-            font=(ui.FONT_FAMILY, 9),
-            state='readonly'  # Make read-only, only clickable
-        )
-        self.secondary_path_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Bind click event to secondary path entry
-        self.secondary_path_entry.bind('<Button-1>', lambda e: self.browse_backup_path('secondary'))
+        total = len(self.employees)
+        active = sum(1 for e in self.employees if e[5])
+        self.count_label.configure(
+            text=f"{total} employees  ·  {active} active" if shown == total
+            else f"{shown} of {total} shown")
 
-        # Backup Now button with improved styling
-        backup_btn = tk.Button(
-            backup_frame,
-            text="Backup Now",
-            command=self.create_backup,
-            bg=ui.SUCCESS,
-            fg=ui.TEXT_ON_DARK,
-            font=(ui.FONT_FAMILY, 11, 'bold'),
-            relief='raised',
-            bd=2,
-            padx=20,
-            pady=5
-        )
-        backup_btn.pack(pady=10)
-        
-        # Add hover effects for backup button
-        backup_btn.bind('<Enter>', lambda e: backup_btn.configure(bg=ui.SUCCESS_HOVER))
-        backup_btn.bind('<Leave>', lambda e: backup_btn.configure(bg=ui.SUCCESS))
+        if self.editing is not None and self.tree.exists(self.editing):
+            self.tree.selection_set(self.editing)
 
-        # Add hover effects for text entries
-        def on_enter(event):
-            event.widget.config(bg='#e8e8e8')  # Slightly darker on hover
+    def on_tree_select(self, event=None):
+        """Load the selected employee into the form."""
+        selected = self.tree.selection()
+        if not selected or selected[0] == self.editing:
+            return
+        emp_number = selected[0]
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, MOBILE_NUMBER,
+                       DESIGNATION, DEPARTMENT, IS_ACTIVE
+                FROM EMPLOYEE_INFO
+                WHERE EMPLOYEE_NUMBER = %s
+            """, (emp_number,))
+            record = cursor.fetchone()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as err:
+            self.banner.show(f"Could not load the employee: {err}", 'danger')
+            return
+        if not record:
+            return
 
-        def on_leave(event):
-            event.widget.config(bg='#f0f0f0')  # Back to normal color
+        name, number, mobile, designation, department, active = record
+        for key, value in (('name', name), ('number', number), ('password', ''),
+                           ('mobile', mobile), ('designation', designation),
+                           ('department', department)):
+            self.entries[key].delete(0, tk.END)
+            self.entries[key].insert(0, value or '')
+        self.active_var.set(bool(active))
+        self.set_mode(number)
+        self.banner.show(f"Editing {name}. Change the details and press Save Changes.",
+                         'info')
 
-        for entry in [self.primary_path_entry, self.secondary_path_entry]:
-            entry.bind('<Enter>', on_enter)
-            entry.bind('<Leave>', on_leave)
+    # ------------------------------------------------------------------
+    # Employee form
+    # ------------------------------------------------------------------
+
+    def set_mode(self, emp_number):
+        """Switch the form between adding (None) and editing an employee."""
+        self.editing = emp_number
+        self.add_button.pack_forget()
+        self.save_button.pack_forget()
+        self.delete_button.pack_forget()
+        if emp_number is None:
+            self.mode_label.configure(text="NEW EMPLOYEE")
+            self.password_hint.config(text="Set the password they will sign in with.")
+            self.add_button.pack(side=tk.LEFT)
+        else:
+            self.mode_label.configure(text=f"EDITING {emp_number}")
+            self.password_hint.config(text="Leave the password blank to keep the current one.")
+            self.save_button.pack(side=tk.LEFT)
+            self.delete_button.pack(side=tk.LEFT, padx=(ui.PAD, 0))
+
+    def form_values(self, need_password):
+        """The form's values, or None after pointing at the first one missing."""
+        values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        for key, title in FIELDS:
+            if key == 'password' and not need_password:
+                continue
+            if not values[key]:
+                self.banner.show(f"Please enter the {title.lower()}.", 'warning')
+                self.entries[key].focus_set()
+                return None
+        return values
+
+    def clear_entries(self):
+        """Empty the form, ready for a new employee."""
+        for entry in self.entries.values():
+            entry.delete(0, tk.END)
+        self.active_var.set(True)
+        self.set_mode(None)
+        if self.tree.selection():
+            self.tree.selection_remove(self.tree.selection())
+        self.banner.show("Fill in the form to add an employee, or pick one from the list.",
+                         'idle')
+        self.entries['name'].focus_set()
+
+    def add_record(self):
+        """Add a new employee record"""
+        values = self.form_values(need_password=True)
+        if values is None:
+            return
+
+        machine_id = self.machine_id_var.get().strip()
+        if not machine_id:
+            self.banner.show("Set and save the Machine ID first.", 'warning')
+            self.machine_id_entry.focus_set()
+            return
+
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO EMPLOYEE_INFO (
+                    EMPLOYEE_FULL_NAME, EMPLOYEE_NUMBER, PASSWORD,
+                    DESIGNATION, DEPARTMENT, MOBILE_NUMBER, MACHINE_ID, IS_ACTIVE
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                values['name'], values['number'],
+                auth.compute_hash(values['password']),
+                values['designation'], values['department'], values['mobile'],
+                machine_id, bool(self.active_var.get()),
+            ))
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as err:
+            if err.errno == 1062:  # Duplicate entry error
+                self.banner.show(f"Employee number {values['number']} already exists.",
+                                 'danger')
+                self.entries['number'].focus_set()
+            else:
+                messagebox.showerror("Database Error", f"Failed to add employee: {err}")
+            return
+
+        self.load_records()
+        self.clear_entries()
+        self.banner.show(f"{values['name']} added.", 'success')
+
+    def save_record(self):
+        """Save changes to the employee in the form."""
+        if self.editing is None:
+            return
+        values = self.form_values(need_password=False)
+        if values is None:
+            return
+
+        # The password column is only touched when a new one was typed.
+        columns = ["EMPLOYEE_FULL_NAME = %s", "EMPLOYEE_NUMBER = %s",
+                   "DESIGNATION = %s", "DEPARTMENT = %s", "MOBILE_NUMBER = %s",
+                   "IS_ACTIVE = %s"]
+        parameters = [values['name'], values['number'], values['designation'],
+                      values['department'], values['mobile'],
+                      bool(self.active_var.get())]
+        if values['password']:
+            columns.append("PASSWORD = %s")
+            parameters.append(auth.compute_hash(values['password']))
+        parameters.append(self.editing)
+
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE EMPLOYEE_INFO SET " + ", ".join(columns) +
+                           " WHERE EMPLOYEE_NUMBER = %s", tuple(parameters))
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as err:
+            if err.errno == 1062:
+                self.banner.show(f"Employee number {values['number']} already exists.",
+                                 'danger')
+            else:
+                messagebox.showerror("Database Error", f"Failed to update record: {err}")
+            return
+
+        self.editing = values['number']
+        self.load_records()
+        self.set_mode(values['number'])
+        self.entries['password'].delete(0, tk.END)
+        self.banner.show(f"{values['name']} saved.", 'success')
+
+    def delete_record(self):
+        """Delete the employee in the form."""
+        if self.editing is None:
+            return
+        name = self.entries['name'].get().strip() or self.editing
+        if not messagebox.askyesno(
+                "Delete Employee",
+                f"Delete {name} ({self.editing})?\n\n"
+                "To stop someone signing in but keep their record, untick "
+                "Active and save instead.", parent=self.root):
+            return
+
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM EMPLOYEE_INFO WHERE EMPLOYEE_NUMBER = %s",
+                           (self.editing,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to delete record: {err}")
+            return
+
+        self.editing = None
+        self.load_records()
+        self.clear_entries()
+        self.banner.show(f"{name} deleted.", 'success')
+
+    # ------------------------------------------------------------------
+    # Machine and archive folders
+    # ------------------------------------------------------------------
 
     def browse_backup_path(self, path_type):
         """Open folder selection dialog and update backup path"""
         try:
-            # Get current path or default to home directory
             current_path = self.backup_paths.get(path_type, '')
-            if not current_path or current_path.startswith('Click to select'):
-                initial_dir = os.path.expanduser('~')
-            else:
-                initial_dir = current_path
-                
-            # Open folder selection dialog
+            initial_dir = current_path if current_path and os.path.isdir(current_path) \
+                else os.path.expanduser('~')
+
             folder_path = filedialog.askdirectory(
-                title=f"Select {path_type.title()} Backup Location",
+                parent=self.root,
+                title=f"Select {path_type.title()} Archive Folder",
                 initialdir=initial_dir
             )
-            
-            if folder_path:
-                # Update the path in the interface and storage
-                if path_type == 'primary':
-                    self.primary_path_entry.config(state='normal')  # Temporarily enable
-                    self.primary_path_var.set(folder_path)
-                    self.primary_path_entry.config(fg='#000000', state='readonly')  # Black text for selected path
-                else:
-                    self.secondary_path_entry.config(state='normal')  # Temporarily enable
-                    self.secondary_path_var.set(folder_path)
-                    self.secondary_path_entry.config(fg='#000000', state='readonly')  # Black text for selected path
-                
-                # Store in backup_paths dictionary
-                self.backup_paths[path_type] = folder_path
-                
-                # Save to the settings file
-                config.set(f'{path_type.upper()}_BACKUP_PATH', folder_path)
-                
-                messagebox.showinfo("Success", f"{path_type.title()} backup path set successfully!")
-                
+            if not folder_path:
+                return
+
+            self.backup_paths[path_type] = folder_path
+            config.set(f'{path_type.upper()}_BACKUP_PATH', folder_path)
+            self.show_path(path_type)
+            self.banner.show(f"{path_type.title()} archive folder set.", 'success')
+
         except Exception as e:
-            messagebox.showerror(
-                "Error",
-                f"Failed to set {path_type} backup path:\n{str(e)}"
-            )
+            messagebox.showerror("Error", f"Failed to set {path_type} backup path:\n{e}")
 
     def create_backup(self):
         """Create backup of last 3 months data"""
+        conn = None
         try:
-            # Validate backup paths
-            primary_path = self.primary_path_var.get()
-            secondary_path = self.secondary_path_var.get()
-            
-            # Check for placeholder text or empty paths
-            if primary_path.startswith('Click to select') or not primary_path.strip():
-                primary_path = None
-            if secondary_path.startswith('Click to select') or not secondary_path.strip():
-                secondary_path = None
-            
+            primary_path = self.backup_paths.get('primary') or None
+            secondary_path = self.backup_paths.get('secondary') or None
+
             if not primary_path and not secondary_path:
                 messagebox.showerror("Error", "Please select at least one valid backup location!")
                 return
-            
+
             # Validate that paths exist
             if primary_path and not os.path.exists(primary_path):
                 messagebox.showerror("Error", f"Primary backup path does not exist: {primary_path}")
@@ -883,53 +583,46 @@ class AdminConsole:
             if secondary_path and not os.path.exists(secondary_path):
                 messagebox.showerror("Error", f"Secondary backup path does not exist: {secondary_path}")
                 return
-            
+
             # Calculate date range
             end_date = datetime.now()
             start_date = end_date - timedelta(days=90)  # 3 months
-            
-            # Connect to database
+
             conn = mysql.connector.connect(**self.db_config)
             cursor = conn.cursor()
-            
-            # Get data for last 3 months
-            query = """
-                SELECT 
-                    EMPLOYEE_FULL_NAME, 
-                    EMPLOYEE_NUMBER, 
-                    DESIGNATION, 
-                    DEPARTMENT, 
-                    MOBILE_NUMBER, 
+            cursor.execute("""
+                SELECT
+                    EMPLOYEE_FULL_NAME,
+                    EMPLOYEE_NUMBER,
+                    DESIGNATION,
+                    DEPARTMENT,
+                    MOBILE_NUMBER,
                     MACHINE_ID,
                     IS_ACTIVE,
                     CREATED_DATE
-                FROM EMPLOYEE_INFO 
+                FROM EMPLOYEE_INFO
                 WHERE CREATED_DATE BETWEEN %s AND %s
-            """
-            
-            cursor.execute(query, (start_date, end_date))
+            """, (start_date, end_date))
             data = cursor.fetchall()
-            
+            cursor.close()
+
             if not data:
                 messagebox.showinfo("Info", "No data found for the last 3 months")
                 return
-            
-            # Create backup files
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"employee_backup_{timestamp}.csv"
-            
-            # Headers for CSV file
             headers = [
-                "Employee Name", 
-                "Employee Number", 
-                "Designation", 
-                "Department", 
-                "Mobile Number", 
+                "Employee Name",
+                "Employee Number",
+                "Designation",
+                "Department",
+                "Mobile Number",
                 "Machine ID",
                 "Status",
                 "Created Date"
             ]
-            
+
             def save_backup(path):
                 if path:
                     full_path = os.path.join(path, filename)
@@ -940,14 +633,10 @@ class AdminConsole:
                             writer.writerow(row)
                     return full_path
                 return None
-            
-            # Create primary backup
+
             primary_file = save_backup(primary_path)
-            
-            # Create secondary backup
             secondary_file = save_backup(secondary_path)
-            
-            # Create backup info file
+
             backup_info = {
                 'timestamp': timestamp,
                 'date_range': {
@@ -958,62 +647,51 @@ class AdminConsole:
                 'primary_location': primary_file,
                 'secondary_location': secondary_file
             }
-            
+
             if primary_path:
                 info_file = os.path.join(primary_path, f"backup_info_{timestamp}.json")
                 with open(info_file, 'w') as f:
                     json.dump(backup_info, f, indent=4)
-            
-            messagebox.showinfo("Success", 
-                              f"Backup created successfully!\n"
-                              f"Records backed up: {len(data)}\n"
-                              f"Date range: {start_date.date()} to {end_date.date()}")
-            
+
+            messagebox.showinfo("Success",
+                                f"Backup created successfully!\n"
+                                f"Records backed up: {len(data)}\n"
+                                f"Date range: {start_date.date()} to {end_date.date()}")
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create backup: {str(e)}")
         finally:
-            if 'conn' in locals():
-                cursor.close()
+            if conn is not None:
                 conn.close()
 
     def save_machine_id(self):
-        """Save Machine ID to environment variable and update database"""
+        """Save the Machine ID and give it to employees that have none."""
         try:
             machine_id = self.machine_id_var.get().strip()
             if not machine_id:
-                messagebox.showwarning("Warning", "Please enter a Machine ID")
+                self.banner.show("Please enter a Machine ID.", 'warning')
+                self.machine_id_entry.focus_set()
                 return
-            
+
             # Save to the settings file
             config.set('MACHINE_ID', machine_id)
             self.machine_id = machine_id
-            
-            # Update database with machine ID for all records
+
             conn = mysql.connector.connect(**self.db_config)
             cursor = conn.cursor()
-            
-            # Update all records with the new machine ID where it's NULL or empty
             cursor.execute("""
-                UPDATE EMPLOYEE_INFO 
-                SET MACHINE_ID = %s 
+                UPDATE EMPLOYEE_INFO
+                SET MACHINE_ID = %s
                 WHERE MACHINE_ID IS NULL OR MACHINE_ID = ''
             """, (machine_id,))
-            
             conn.commit()
             cursor.close()
             conn.close()
-            
-            messagebox.showinfo("Success", f"Machine ID saved: {machine_id}")
-            
-            # Update window title with new machine ID
-            title = "ADMIN CONSOLE"
-            if self.machine_id:
-                title += f" - Machine ID: {self.machine_id}"
-            self.root.title(title)
-            
-            # Refresh the display
+
+            self.set_title()
             self.load_records()
-            
+            self.banner.show(f"Machine ID saved: {machine_id}", 'success')
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save Machine ID: {str(e)}")
 
@@ -1021,20 +699,22 @@ class AdminConsole:
         """Cleanup function called when closing the application"""
         try:
             # Save backup paths and machine ID to the settings file
-            if self.backup_paths.get('primary') and not self.backup_paths['primary'].startswith('Click to select'):
+            if self.backup_paths.get('primary'):
                 config.set('PRIMARY_BACKUP_PATH', self.backup_paths['primary'])
-            if self.backup_paths.get('secondary') and not self.backup_paths['secondary'].startswith('Click to select'):
+            if self.backup_paths.get('secondary'):
                 config.set('SECONDARY_BACKUP_PATH', self.backup_paths['secondary'])
             if self.machine_id_var.get().strip():
                 config.set('MACHINE_ID', self.machine_id_var.get().strip())
-            
+
         except Exception as e:
             print(f"Error during cleanup: {str(e)}")
+
 
 def main():
     root = tk.Tk()
     app = AdminConsole(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
