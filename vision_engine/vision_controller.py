@@ -12,10 +12,15 @@ Methodology:
   - Inspect: capture a live frame and search for the Template across it with
     cv2.matchTemplate.
   - Result: if the best match score >= threshold the part is present and correct.
+
+Storage:
+  Everything lives in the EOL database, next to the test data it gates:
+  TBL_VISION_SETTINGS holds the settings and camera choice as key/value rows,
+  and TBL_VISION_MODEL holds one row per taught part, its templates packed
+  into VM_MODEL as a compressed NumPy archive.
 """
-import configparser
+import io
 import json
-import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -27,10 +32,13 @@ from . import camera
 
 DEFAULT_MATCH_THRESHOLD = 0.75
 
-_ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
-_VISION_CFG_PATH = os.path.join(_ROOT_DIR, "vision_config.json")
-_CAM_CFG_PATH = os.path.join(_ROOT_DIR, "camera_cfg.ini")
-_MODELS_DIR = os.path.join(_ROOT_DIR, "vision_models")
+
+class VisionStorageError(OSError):
+    """The vision tables could not be read or written.
+
+    An OSError, so callers that already guard their saves against a disk
+    error cover the database the same way.
+    """
 
 
 @dataclass
@@ -51,30 +59,100 @@ class VisionResult:
     frame: Optional[np.ndarray] = None                      # frame that was judged
 
 
+# ── Database access ────────────────────────────────────────────────────────────
+
+_tables_ready = False
+
+
+def _run(sql: str, params: tuple = (), fetch: bool = False):
+    """Run one statement on its own connection. Returns the rows when `fetch`."""
+    global _tables_ready
+    import db
+    import mysql.connector
+
+    try:
+        if not _tables_ready:
+            # Creates only what is missing, so a machine that has not been
+            # restarted since the vision tables were added still gets them.
+            db.init_database(raise_on_error=True)
+            _tables_ready = True
+        conn = db.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            rows = cursor.fetchall() if fetch else None
+            conn.commit()
+            cursor.close()
+            return rows
+        finally:
+            conn.close()
+    except mysql.connector.Error as e:
+        raise VisionStorageError(str(e)) from e
+
+
+def _read_settings() -> Dict[str, str]:
+    """Every stored setting, or an empty dict when the database is unreachable.
+
+    Reading falls back to defaults rather than failing: a machine with its
+    database down should report "no camera" or "no model", not crash.
+    """
+    try:
+        rows = _run("SELECT VS_KEY, VS_VALUE FROM TBL_VISION_SETTINGS", fetch=True)
+    except VisionStorageError as e:
+        print(f"Vision: could not read settings: {e}")
+        return {}
+    return {key: value for key, value in rows}
+
+
+def _write_settings(values: Dict[str, object]):
+    for key, value in values.items():
+        _run("INSERT INTO TBL_VISION_SETTINGS (VS_KEY, VS_VALUE) VALUES (%s, %s) AS new "
+             "ON DUPLICATE KEY UPDATE VS_VALUE = new.VS_VALUE",
+             (key, str(value)))
+
+
+def _int(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _float(value, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+# ── Settings ───────────────────────────────────────────────────────────────────
+
 def _default_config() -> dict:
     return {
         "vision_enabled": True,
         "camera_source": "cam1",
         "match_threshold": DEFAULT_MATCH_THRESHOLD,
-        "part_mapping": {},
     }
 
 
 def load_vision_config() -> dict:
     cfg = _default_config()
-    if os.path.exists(_VISION_CFG_PATH):
-        try:
-            with open(_VISION_CFG_PATH, "r") as f:
-                cfg.update(json.load(f))
-        except (OSError, ValueError):
-            pass
+    stored = _read_settings()
+    if "vision_enabled" in stored:
+        cfg["vision_enabled"] = stored["vision_enabled"].strip().lower() in ("1", "true", "yes")
+    if stored.get("camera_source"):
+        cfg["camera_source"] = stored["camera_source"]
+    if "match_threshold" in stored:
+        cfg["match_threshold"] = _float(stored["match_threshold"], DEFAULT_MATCH_THRESHOLD)
     return cfg
 
 
 def save_vision_config(cfg: dict):
-    with open(_VISION_CFG_PATH, "w") as f:
-        json.dump(cfg, f, indent=4)
-        f.write("\n")
+    _write_settings({
+        "vision_enabled": 1 if cfg.get("vision_enabled", True) else 0,
+        "camera_source": cfg.get("camera_source", "cam1"),
+        "match_threshold": float(cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)),
+    })
 
 
 def load_camera_config(source: str) -> Tuple[int, int, int]:
@@ -82,35 +160,47 @@ def load_camera_config(source: str) -> Tuple[int, int, int]:
 
     An index of -1 means no device has been chosen for that source yet.
     """
-    cfg = configparser.ConfigParser()
-    if os.path.exists(_CAM_CFG_PATH):
-        cfg.read(_CAM_CFG_PATH)
+    stored = _read_settings()
     return (
-        cfg.getint("CAMERA", f"{source}_index", fallback=-1),
-        cfg.getint("CAMERA", f"{source}_width", fallback=640),
-        cfg.getint("CAMERA", f"{source}_height", fallback=480),
+        _int(stored.get(f"{source}_index"), -1),
+        _int(stored.get(f"{source}_width"), 640),
+        _int(stored.get(f"{source}_height"), 480),
     )
 
 
 def save_camera_config(source: str, index: int, width: int, height: int):
-    """Store the device and resolution for one camera source.
-
-    Other sources already in the file are kept as they are.
-    """
-    cfg = configparser.ConfigParser()
-    if os.path.exists(_CAM_CFG_PATH):
-        cfg.read(_CAM_CFG_PATH)
-    if not cfg.has_section("CAMERA"):
-        cfg.add_section("CAMERA")
-    cfg.set("CAMERA", f"{source}_index", str(int(index)))
-    cfg.set("CAMERA", f"{source}_width", str(int(width)))
-    cfg.set("CAMERA", f"{source}_height", str(int(height)))
-    with open(_CAM_CFG_PATH, "w") as f:
-        cfg.write(f)
+    """Store the device and resolution for one camera source."""
+    _write_settings({
+        f"{source}_index": int(index),
+        f"{source}_width": int(width),
+        f"{source}_height": int(height),
+    })
 
 
 def get_vision_controller() -> "VisionController":
     return VisionController()
+
+
+# ── Model packing ──────────────────────────────────────────────────────────────
+
+def _pack_model(model_cfg: dict, templates: List[np.ndarray]) -> bytes:
+    buffer = io.BytesIO()
+    arrays = {"config": np.array(json.dumps(model_cfg))}
+    for i, t in enumerate(templates):
+        arrays[f"template_{i}"] = t
+    np.savez_compressed(buffer, **arrays)
+    return buffer.getvalue()
+
+
+def _unpack_model(blob: bytes) -> Tuple[dict, List[np.ndarray]]:
+    data = np.load(io.BytesIO(blob), allow_pickle=False)
+    model_cfg = json.loads(str(data["config"]))
+    templates = []
+    i = 0
+    while f"template_{i}" in data:
+        templates.append(data[f"template_{i}"])
+        i += 1
+    return model_cfg, templates
 
 
 class VisionController:
@@ -144,42 +234,47 @@ class VisionController:
 
     # ── Model I/O ───────────────────────────────────────────────────────────
 
-    def _model_path(self, part_number: str) -> Optional[str]:
-        filename = self.config.get("part_mapping", {}).get(part_number)
-        if not filename:
-            return None
-        path = os.path.join(_MODELS_DIR, filename)
-        return path if os.path.exists(path) else None
-
     def _load_model(self, part_number: str) -> Optional[dict]:
+        """The taught model, None when there is none or it cannot be decoded.
+
+        Raises VisionStorageError when the database cannot be reached, so an
+        outage is not mistaken for a part that was never taught.
+        """
         if part_number in self._model_cache:
             return self._model_cache[part_number]
 
-        path = self._model_path(part_number)
-        if path is None:
+        rows = _run("SELECT VM_MODEL FROM TBL_VISION_MODEL WHERE VM_PART_NUMBER = %s",
+                    (part_number,), fetch=True)
+        if not rows:
             return None
 
         try:
-            data = np.load(path, allow_pickle=True)
-            model_cfg = json.loads(str(data["config"]))
-
-            templates = []
-            i = 0
-            while f"template_{i}" in data:
-                templates.append(data[f"template_{i}"])
-                i += 1
-
-            model_cfg["templates"] = templates
-            self._model_cache[part_number] = model_cfg
-            return model_cfg
+            model_cfg, templates = _unpack_model(bytes(rows[0][0]))
         except (OSError, ValueError, KeyError):
             return None
 
+        model_cfg["templates"] = templates
+        self._model_cache[part_number] = model_cfg
+        return model_cfg
+
     def has_model(self, part_number: str) -> bool:
-        return self._model_path(part_number) is not None
+        rows = _run("SELECT 1 FROM TBL_VISION_MODEL WHERE VM_PART_NUMBER = %s",
+                    (part_number,), fetch=True)
+        return bool(rows)
 
     def get_mapped_parts(self) -> dict:
-        return dict(self.config.get("part_mapping", {}))
+        """{part number: where its model is kept} for every taught part.
+
+        Every model is a row of TBL_VISION_MODEL, so that is what each part
+        maps to. Empty when the database cannot be reached.
+        """
+        try:
+            rows = _run("SELECT VM_PART_NUMBER FROM TBL_VISION_MODEL "
+                        "ORDER BY VM_PART_NUMBER", fetch=True)
+        except VisionStorageError as e:
+            print(f"Vision: could not list taught parts: {e}")
+            return {}
+        return {row[0]: "TBL_VISION_MODEL" for row in rows}
 
     # ── Production Inspection ───────────────────────────────────────────────
 
@@ -201,7 +296,10 @@ class VisionController:
         if not self.config.get("vision_enabled", True):
             return _error("Vision inspection disabled")
 
-        model = self._load_model(part_number)
+        try:
+            model = self._load_model(part_number)
+        except VisionStorageError as e:
+            return _error(f"Vision database unavailable: {e}")
         if model is None:
             return _error(f"No vision model found for '{part_number}'")
 
@@ -272,6 +370,8 @@ class VisionController:
         box lands on background in any reference where the part sat elsewhere, and
         a background template matches the live background at a high score — which
         would pass an empty fixture.
+
+        Returns the part number saved.
         """
         rois = list(roi) if isinstance(roi, (list, tuple)) else [roi] * len(images)
         if len(rois) != len(images):
@@ -293,41 +393,38 @@ class VisionController:
                 )
             templates.append(gray[y:y + h, x:x + w])
 
+        created = time.strftime("%Y-%m-%dT%H:%M:%S")
         model_cfg = {
             "part_number": part_number,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "created": created,
             "rois": rois,
             "roi": rois[0],          # older readers expect a single region
             "match_threshold": match_threshold,
             "num_references": len(templates),
         }
 
-        os.makedirs(_MODELS_DIR, exist_ok=True)
-        filename = f"{part_number}.npz"
-        model_path = os.path.join(_MODELS_DIR, filename)
-
-        save_dict = {"config": json.dumps(model_cfg)}
-        for i, t in enumerate(templates):
-            save_dict[f"template_{i}"] = t
-        np.savez_compressed(model_path, **save_dict)
-
-        self.config.setdefault("part_mapping", {})[part_number] = filename
-        save_vision_config(self.config)
+        _run("INSERT INTO TBL_VISION_MODEL "
+             "(VM_PART_NUMBER, VM_MODEL, VM_THRESHOLD, VM_REFERENCES, VM_CREATED) "
+             "VALUES (%s, %s, %s, %s, %s) AS new "
+             "ON DUPLICATE KEY UPDATE VM_MODEL = new.VM_MODEL, "
+             "VM_THRESHOLD = new.VM_THRESHOLD, VM_REFERENCES = new.VM_REFERENCES, "
+             "VM_CREATED = new.VM_CREATED",
+             (part_number, _pack_model(model_cfg, templates), float(match_threshold),
+              len(templates), created.replace("T", " ")))
         self._model_cache.pop(part_number, None)
 
-        return model_path
+        return part_number
 
     def delete_model(self, part_number: str):
-        path = self._model_path(part_number)
-        if path and os.path.exists(path):
-            os.remove(path)
-        self.config.get("part_mapping", {}).pop(part_number, None)
-        save_vision_config(self.config)
+        _run("DELETE FROM TBL_VISION_MODEL WHERE VM_PART_NUMBER = %s", (part_number,))
         self._model_cache.pop(part_number, None)
 
     def model_info(self, part_number: str) -> Optional[dict]:
         """Metadata for a taught part, or None if it has no usable model."""
-        model = self._load_model(part_number)
+        try:
+            model = self._load_model(part_number)
+        except VisionStorageError:
+            return None
         if model is None:
             return None
         templates = model.get("templates", [])
@@ -351,28 +448,21 @@ class VisionController:
 
         A model carries the threshold it was taught with and that value wins over
         the global default at inspection time, so tuning a part has to reach into
-        the .npz rather than the config file.
+        the stored model rather than the settings.
         """
-        path = self._model_path(part_number)
-        if path is None:
-            raise ValueError(f"No model file mapped to '{part_number}'.")
+        rows = _run("SELECT VM_MODEL FROM TBL_VISION_MODEL WHERE VM_PART_NUMBER = %s",
+                    (part_number,), fetch=True)
+        if not rows:
+            raise ValueError(f"No vision model for '{part_number}'.")
 
-        data = np.load(path, allow_pickle=True)
-        model_cfg = json.loads(str(data["config"]))
+        model_cfg, templates = _unpack_model(bytes(rows[0][0]))
         model_cfg["match_threshold"] = float(threshold)
-
-        save_dict = {"config": json.dumps(model_cfg)}
-        i = 0
-        while f"template_{i}" in data:
-            save_dict[f"template_{i}"] = data[f"template_{i}"]
-            i += 1
-        np.savez_compressed(path, **save_dict)
+        _run("UPDATE TBL_VISION_MODEL SET VM_MODEL = %s, VM_THRESHOLD = %s "
+             "WHERE VM_PART_NUMBER = %s",
+             (_pack_model(model_cfg, templates), float(threshold), part_number))
         self._model_cache.pop(part_number, None)
 
     def map_model_file(self, part_number: str, filename: str):
-        """Point a part number at an existing model file in vision_models/."""
-        if not os.path.exists(os.path.join(_MODELS_DIR, filename)):
-            raise ValueError(f"Model file '{filename}' not found.")
-        self.config.setdefault("part_mapping", {})[part_number] = filename
-        save_vision_config(self.config)
-        self._model_cache.pop(part_number, None)
+        """Kept for callers written against model files; there are none now."""
+        raise ValueError("Vision models are stored in the database, "
+                         "so there are no model files to map.")
