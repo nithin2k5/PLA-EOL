@@ -1,853 +1,2354 @@
-"""Vision settings: choose the camera, teach parts and try them out.
-
-Built like the other consoles - handed a window or a panel to fill - so
-the main console can open it in its page area. Everything it changes goes
-through vision_engine, the same code the Test console judges parts with,
-so what passes here passes on the line.
 """
+vision_settings.py
+===================
+Vision Settings page.
 
+Teach, tune and verify the template-matching models that gate production.
+
+The page is a thin shell over vision_engine.vision_controller: it never matches
+or judges anything itself, so what an operator verifies here is exactly what the
+test cycle will do on the line.
+
+It is built like the other consoles - handed a window or a panel to fill - and
+drawn in the shared palette from ui.py.
+"""
 import os
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, filedialog, messagebox
 
-import cv2
-import numpy as np
-from PIL import Image, ImageTk
+import customtkinter as ctk
 
-import db
 import ui
-from vision_engine import (
-    VisionController,
-    load_camera_config,
-    save_camera_config,
-    save_vision_config,
-)
-from vision_engine import camera
-from vision_engine.vision_controller import DEFAULT_MATCH_THRESHOLD
 
-CAMERA_SOURCES = ('cam1', 'cam2')
-RESOLUTIONS = ('640x480', '800x600', '1280x720', '1920x1080')
+try:
+    import cv2
+    import numpy as np
+    _cv2_ok = True
+except ImportError:
+    _cv2_ok = False
 
-# How often the live view is redrawn, and how often a background test is
-# checked for its result.
-PREVIEW_MS = 40
-POLL_MS = 100
+try:
+    from PIL import Image, ImageTk
+    _pil_ok = True
+except ImportError:
+    _pil_ok = False
 
-# Boxes drawn over the picture.
-BOX_TAUGHT = ui.SKY
-BOX_DRAWING = ui.WARNING
-BOX_OK = ui.LAMP_PASS
-BOX_NG = ui.LAMP_FAIL
 
-# A box smaller than this on either side is refused by the engine.
-MIN_BOX = 10
+# ── Palette ────────────────────────────────────────────────────────────────────
+# Taken from ui.py so the page reads as part of the same application.
+BG          = ui.APP_BG
+PANEL       = ui.SURFACE
+LINE        = ui.BORDER
+FIELD       = ui.SURFACE
+VIEW_BG     = ui.SUBTLE          # behind an image, where it does not fill the view
+TXT         = ui.TEXT
+TXT_DIM     = ui.TEXT_MUTED
+TXT_FAINT   = ui.TEXT_MUTED
+ACCENT      = ui.ACCENT
+OK_GREEN    = ui.SUCCESS
+NG_RED      = ui.DANGER
+WARN        = ui.WARNING_HOVER   # the darker orange, to stay legible on white
+
+FONT = ui.FONT_FAMILY
+MONO = "Consolas"
+
+BTN_PRIMARY = "primary"
+BTN_SUCCESS = "success"
+BTN_DANGER  = "danger"
+BTN_NEUTRAL = "neutral"
+
+_BUTTON_COLOURS = {
+    BTN_PRIMARY: (ui.ACCENT_FILL, ui.ACCENT_HOVER),
+    BTN_SUCCESS: (ui.SUCCESS, ui.SUCCESS_HOVER),
+    BTN_DANGER:  (ui.DANGER, ui.DANGER_HOVER),
+    BTN_NEUTRAL: (ui.SUBTLE, ui.BORDER),
+}
+
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vision_models")
+
+RESOLUTIONS = [(320, 240), (640, 480), (800, 600), (1280, 720), (1920, 1080)]
+
+
+# ── Camera config (same file and keys the vision engine reads) ─────────────────
+
+def _camera_source() -> str:
+    from vision_engine import load_vision_config
+    return load_vision_config().get("camera_source", "cam1")
+
+
+def _load_cam_cfg() -> dict:
+    from vision_engine import load_camera_config
+    index, width, height = load_camera_config(_camera_source())
+    return {"index": index, "width": width, "height": height, "enabled": index >= 0}
+
+
+def _save_cam_cfg(index: int, width: int, height: int, enabled: bool):
+    """Store the inspection camera; a disabled camera is saved as index -1."""
+    from vision_engine import save_camera_config
+    save_camera_config(_camera_source(), index if enabled else -1, width, height)
+
+
+def _probe_cameras(max_index: int = 6):
+    """Indices that open *and* deliver a frame, with their native resolution.
+
+    A device that opens but never yields a frame is worse than no device at all —
+    it looks configured and then fails mid-cycle — so opening is not enough to
+    call a camera present.
+    """
+    found = []
+    if not _cv2_ok:
+        return found
+    for i in range(max_index):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    found.append({
+                        "index": i,
+                        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640,
+                        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480,
+                    })
+        except Exception:
+            pass
+        finally:
+            if cap is not None:
+                cap.release()
+    return found
+
+
+def _read_image(path):
+    """cv2.imread that also opens paths with non-ASCII characters on Windows."""
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+# ── Part master (the model master is where every part number is defined) ───────
+
+def _fetch_master_parts():
+    """[(part number, model name), ...] from the model master, or None if it
+    can't be reached.
+
+    The page otherwise only talks to the camera and the filesystem, so this
+    stays a soft, best-effort lookup: callers fall back to free-text entry
+    when it returns None instead of blocking teaching.
+    """
+    try:
+        import db
+        conn = db.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT MM_PART_NUMBER, MM_MODEL_NAME FROM TBL_MODEL_MASTER "
+                        "ORDER BY MM_PART_NUMBER")
+            rows = [(str(r[0]), r[1] or "") for r in cur.fetchall() if r[0]]
+            cur.close()
+        finally:
+            conn.close()
+        return rows
+    except Exception:
+        return None
+
+
+def _part_choice_label(pno, pname):
+    return "%s — %s" % (pno, pname) if pname else pno
+
+
+class _PnoField:
+    """Part-number input: a locked-to-the-master combobox when the model master
+    is reachable, a free-text Entry when it isn't. Exposes the same get / set /
+    lock / focus_set / bind / pack surface either way so call sites don't need
+    to know which one is live underneath.
+    """
+
+    def __init__(self, parent, master_parts, font_size=15):
+        self._by_label = {}
+        self.is_master_backed = bool(master_parts)
+        if master_parts:
+            labels = []
+            for pno, pname in master_parts:
+                label = _part_choice_label(pno, pname)
+                self._by_label[label] = pno
+                labels.append(label)
+            self.widget = ttk.Combobox(parent, state="readonly", values=labels,
+                                       font=(MONO, font_size))
+        else:
+            self.widget = tk.Entry(parent, bg=FIELD, fg=TXT,
+                                   font=(MONO, font_size),
+                                   insertbackground=TXT, relief="flat",
+                                   highlightthickness=1, highlightbackground=LINE,
+                                   highlightcolor=ACCENT)
+
+    def get(self) -> str:
+        raw = self.widget.get().strip()
+        if raw in self._by_label:
+            return self._by_label[raw]
+        return raw.upper()
+
+    def set(self, pno):
+        if self.is_master_backed:
+            label = next((l for l, p in self._by_label.items() if p == pno), pno)
+            self.widget.set(label)
+        else:
+            self.widget.delete(0, "end")
+            self.widget.insert(0, pno)
+
+    def lock(self):
+        if self.is_master_backed:
+            self.widget.config(state="disabled")
+        else:
+            self.widget.config(state="readonly", readonlybackground=FIELD, fg=TXT_DIM)
+
+    def focus_set(self):
+        self.widget.focus_set()
+
+    def pack(self, **kw):
+        self.widget.pack(**kw)
+
+    def bind(self, sequence, func):
+        self.widget.bind(sequence, func)
+        # A readonly combobox never emits KeyRelease from a pick — it emits
+        # its own selection event — so route both through the same handler.
+        if self.is_master_backed and sequence == "<KeyRelease>":
+            self.widget.bind("<<ComboboxSelected>>", func)
+
+
+# ── Small widget helpers ───────────────────────────────────────────────────────
+
+def _btn(parent, text, kind=BTN_NEUTRAL, command=None, width=None, font_size=11,
+         pady=6, icon=None):
+    """A rounded button in one of the palette's meaningful colours."""
+    fg, hover = _BUTTON_COLOURS[kind]
+    ink = ui.readable_on(fg)
+    b = ctk.CTkButton(parent, text=text, command=command,
+                      fg_color=fg, hover_color=hover, text_color=ink,
+                      text_color_disabled=ui.DISABLED_TEXT,
+                      corner_radius=ui.CORNER_RADIUS_SMALL,
+                      font=(FONT, font_size, "bold"),
+                      width=width or 60, height=font_size * 2 + pady * 2,
+                      image=ui.icon_image(icon, ink, 18) if icon else None,
+                      compound="left")
+    b._colors = (fg, hover)
+    b._icon = (icon, ink)
+    return b
+
+
+def _set_btn_enabled(btn, enabled: bool):
+    icon, ink = btn._icon
+    if enabled:
+        btn.configure(state="normal", fg_color=btn._colors[0])
+    else:
+        btn.configure(state="disabled", fg_color=ui.DISABLED_BG)
+    if icon:
+        btn.configure(image=ui.icon_image(icon, ink if enabled else ui.DISABLED_TEXT, 18))
+
+
+def _card(parent, title, subtitle=None, icon=None):
+    """Rounded card with the navy title strip. Returns the card; fill `.body`."""
+    outer = ui.ctk_card(parent)
+    head = ui.ctk_card_header(outer, title.upper(), icon=icon)
+    if subtitle:
+        ctk.CTkLabel(head, text=subtitle, fg_color=ui.NAVY,
+                     text_color=ui.ACCENT_SOFT, font=(FONT, 10)).pack(
+                         side="left", padx=(4, 0))
+
+    body = tk.Frame(outer, bg=PANEL)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    outer.head = head
+    outer.body = body
+    return outer
+
+
+def _kv_row(parent, label, value="—", value_fg=TXT, mono=False):
+    """One label/value line. Returns the value label so callers can update it."""
+    f = tk.Frame(parent, bg=parent["bg"])
+    f.pack(fill="x", pady=2)
+    tk.Label(f, text=label, bg=parent["bg"], fg=TXT_DIM, font=(FONT, 11),
+             width=11, anchor="w").pack(side="left")
+    v = tk.Label(f, text=value, bg=parent["bg"], fg=value_fg, anchor="w",
+                 font=(MONO, 11) if mono else (FONT, 10, "bold"))
+    v.pack(side="left", fill="x", expand=True)
+    return v
+
+
+def _to_photo(img_bgr, box_w, box_h):
+    """BGR ndarray → PhotoImage scaled to fit (box_w, box_h). Returns (photo, scale)."""
+    if img_bgr.ndim == 2:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGB)
+    else:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    ih, iw = rgb.shape[:2]
+    scale = min(box_w / iw, box_h / ih)
+    dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    im = Image.fromarray(rgb).resize((dw, dh), Image.Resampling.BILINEAR)
+    return ImageTk.PhotoImage(im), scale
+
+
+def _threshold_caption(value: float) -> tuple:
+    """Plain-language reading of a correlation threshold."""
+    if value < 0.55:
+        return "Very lenient — almost any frame will pass", NG_RED
+    if value < 0.68:
+        return "Lenient — tolerates lighting and position drift", WARN
+    if value < 0.85:
+        return "Balanced — recommended for production", OK_GREEN
+    if value < 0.94:
+        return "Strict — needs consistent lighting and fixturing", WARN
+    return "Very strict — near-identical frames only", NG_RED
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROI marker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RoiView(tk.Canvas):
+    """Image view with a draggable, resizable region-of-interest marker.
+
+    The marker lives as canvas items on top of the image instead of being burnt
+    into the pixel buffer, so it stays sharp at any display scale and can be
+    nudged or resized after it is drawn.
+
+    Interaction:
+      drag on empty space  -> draw a new box
+      drag inside the box  -> move it
+      drag a handle        -> resize from that edge or corner
+      Delete / Escape      -> clear
+
+    With a locked size (see lock_size) the handles disappear and a click drops a
+    box of that exact size where you point, so a box drawn on one image can be
+    repositioned onto the part in the next without changing what it crops.
+    """
+
+    HANDLE = 4          # handle half-size, screen px
+    GRAB = 7            # grab tolerance around an edge, screen px
+    MIN_ROI = 10        # smallest useful template, image px
+
+    _CURSORS = {
+        "nw": "size_nw_se", "se": "size_nw_se",
+        "ne": "size_ne_sw", "sw": "size_ne_sw",
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "w": "sb_h_double_arrow", "e": "sb_h_double_arrow",
+        "move": "fleur",
+    }
+
+    def __init__(self, parent, on_change=None, editable=True, **kw):
+        super().__init__(parent, bg=VIEW_BG, highlightthickness=0,
+                         bd=0, cursor="crosshair", **kw)
+        self._on_change = on_change
+        self._editable = editable
+        self._image = None          # BGR ndarray
+        self._roi = None            # {"x","y","width","height"} in image coords
+        self._view = None           # (scale, ox, oy, dw, dh)
+        self._photo = None
+        self._drag = None
+        self._placeholder = "No image"
+        self._hint = None
+        self._accent = OK_GREEN
+        self._locked_size = None    # (w, h) in image px, or None for free drawing
+
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Motion>", self._on_hover)
+        self.bind("<Leave>", lambda e: self.config(cursor="crosshair"))
+        self.bind("<Delete>", self.clear_roi)
+        self.bind("<Escape>", self.clear_roi)
+
+    # -- public API ---------------------------------------------------------
+
+    def set_image(self, img, keep_roi=True):
+        prev_shape = None if self._image is None else self._image.shape[:2]
+        self._image = img
+        if img is not None:
+            if not keep_roi:
+                self._roi = None
+            elif prev_shape and prev_shape != img.shape[:2]:
+                self._roi = None        # a box means nothing at a new resolution
+        self._redraw()
+
+    def get_image(self):
+        return self._image
+
+    def set_placeholder(self, text):
+        self._placeholder = text
+        if self._image is None:
+            self._redraw()
+
+    def set_hint(self, text):
+        """Caption drawn along the bottom of the view."""
+        self._hint = text
+        self._redraw()
+
+    def set_editable(self, editable):
+        self._editable = editable
+        self.config(cursor="crosshair" if editable else "arrow")
+        self._redraw()
+
+    def set_accent(self, color):
+        self._accent = color
+        self._redraw()
+
+    def lock_size(self, wh):
+        """Pin the box to (w, h), or pass None to allow free drawing again."""
+        self._locked_size = tuple(wh) if wh else None
+        self._redraw()
+
+    def _place_locked(self, cx, cy):
+        """A locked-size box centred on (cx, cy), kept inside the image."""
+        w, h = self._locked_size
+        ih, iw = self._image.shape[:2]
+        w, h = min(w, iw), min(h, ih)
+        x = min(max(cx - w // 2, 0), iw - w)
+        y = min(max(cy - h // 2, 0), ih - h)
+        return {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+
+    def get_roi(self):
+        return dict(self._roi) if self._roi else None
+
+    def set_roi(self, roi, notify=True):
+        self._roi = dict(roi) if roi else None
+        self._redraw()
+        if notify:
+            self._notify()
+
+    def clear_roi(self, event=None):
+        if not self._editable:
+            return
+        self._roi = None
+        self._redraw()
+        self._notify()
+
+    # -- coordinate mapping -------------------------------------------------
+
+    def _compute_view(self):
+        if self._image is None:
+            self._view = None
+            return
+        cw, ch = self.winfo_width(), self.winfo_height()
+        if cw < 5 or ch < 5:
+            self._view = None
+            return
+        ih, iw = self._image.shape[:2]
+        scale = min(cw / iw, ch / ih)
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        self._view = (scale, (cw - dw) // 2, (ch - dh) // 2, dw, dh)
+
+    def _to_screen(self, ix, iy):
+        s, ox, oy, _, _ = self._view
+        return ox + ix * s, oy + iy * s
+
+    def _to_image(self, sx, sy):
+        s, ox, oy, _, _ = self._view
+        ih, iw = self._image.shape[:2]
+        ix = min(max((sx - ox) / s, 0), iw)
+        iy = min(max((sy - oy) / s, 0), ih)
+        return int(round(ix)), int(round(iy))
+
+    def _roi_screen(self):
+        r = self._roi
+        x0, y0 = self._to_screen(r["x"], r["y"])
+        x1, y1 = self._to_screen(r["x"] + r["width"], r["y"] + r["height"])
+        return x0, y0, x1, y1
+
+    # -- drawing ------------------------------------------------------------
+
+    def _redraw(self):
+        self.delete("all")
+        self._compute_view()
+        cw, ch = max(self.winfo_width(), 1), max(self.winfo_height(), 1)
+
+        if self._view is None:
+            self.create_text(cw // 2, ch // 2, text=self._placeholder,
+                             fill=TXT_FAINT, font=(FONT, 13), justify="center")
+            return
+
+        s, ox, oy, dw, dh = self._view
+        self._photo, _ = _to_photo(self._image, dw, dh)
+        self.create_image(ox, oy, image=self._photo, anchor="nw")
+        self.create_rectangle(ox, oy, ox + dw, oy + dh, outline=LINE)
+
+        if self._roi:
+            self._draw_marker()
+        elif self._drag and self._drag["mode"] == "new":
+            x0, y0 = self._to_screen(*self._drag["anchor"])
+            x1, y1 = self._to_screen(*self._drag["cursor"])
+            self.create_rectangle(x0, y0, x1, y1, outline=ui.ACCENT_FILL, width=2,
+                                  dash=(4, 3))
+
+        if self._hint:
+            tid = self.create_text(cw // 2, ch - 12, text=self._hint, fill=TXT,
+                                   font=(FONT, 11))
+            bx0, by0, bx1, by1 = self.bbox(tid)
+            rid = self.create_rectangle(bx0 - 6, by0 - 2, bx1 + 6, by1 + 2,
+                                        fill=PANEL, outline=LINE)
+            self.tag_raise(tid, rid)
+
+    def _draw_marker(self):
+        s, ox, oy, dw, dh = self._view
+        x0, y0, x1, y1 = self._roi_screen()
+
+        # Dim everything outside the ROI so the taught region reads at a glance.
+        for box in ((ox, oy, ox + dw, y0), (ox, y1, ox + dw, oy + dh),
+                    (ox, y0, x0, y1), (x1, y0, ox + dw, y1)):
+            if box[2] > box[0] and box[3] > box[1]:
+                self.create_rectangle(*box, fill="#000000", outline="",
+                                      stipple="gray50")
+
+        self.create_rectangle(x0, y0, x1, y1, outline=self._accent, width=2)
+
+        # Corner arms read as a machine-vision reticle rather than a plain box.
+        arm = min(18, max(6, int((x1 - x0) // 4)), max(6, int((y1 - y0) // 4)))
+        for cx, cy, sx, sy in ((x0, y0, 1, 1), (x1, y0, -1, 1),
+                               (x0, y1, 1, -1), (x1, y1, -1, -1)):
+            self.create_line(cx, cy, cx + arm * sx, cy, fill=self._accent, width=4)
+            self.create_line(cx, cy, cx, cy + arm * sy, fill=self._accent, width=4)
+
+        if self._editable and self._locked_size is None:
+            for _, hx, hy in self._handles(x0, y0, x1, y1):
+                self.create_rectangle(hx - self.HANDLE, hy - self.HANDLE,
+                                      hx + self.HANDLE, hy + self.HANDLE,
+                                      fill=self._accent, outline=PANEL)
+
+        label = "%d x %d px" % (self._roi["width"], self._roi["height"])
+        ly = y0 - 11 if y0 - 11 > oy + 8 else y1 + 12
+        tid = self.create_text(x0 + 2, ly, text=label,
+                               fill=ui.readable_on(self._accent), anchor="w",
+                               font=(MONO, 11, "bold"))
+        bx0, by0, bx1, by1 = self.bbox(tid)
+        rid = self.create_rectangle(bx0 - 4, by0 - 2, bx1 + 4, by1 + 2,
+                                    fill=self._accent, outline="")
+        self.tag_raise(tid, rid)
+
+    @staticmethod
+    def _handles(x0, y0, x1, y1):
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        return (("nw", x0, y0), ("n", mx, y0), ("ne", x1, y0),
+                ("w", x0, my), ("e", x1, my),
+                ("sw", x0, y1), ("s", mx, y1), ("se", x1, y1))
+
+    # -- hit testing --------------------------------------------------------
+
+    def _hit(self, sx, sy):
+        """'nw'..'se' for a handle, 'move' inside the box, or None."""
+        if not self._roi or self._view is None:
+            return None
+        x0, y0, x1, y1 = self._roi_screen()
+        if self._locked_size is None:
+            for name, hx, hy in self._handles(x0, y0, x1, y1):
+                if abs(sx - hx) <= self.GRAB and abs(sy - hy) <= self.GRAB:
+                    return name
+        if x0 <= sx <= x1 and y0 <= sy <= y1:
+            return "move"
+        return None
+
+    def _on_hover(self, event):
+        if not self._editable or self._drag:
+            return
+        self.config(cursor=self._CURSORS.get(self._hit(event.x, event.y), "crosshair"))
+
+    # -- interaction --------------------------------------------------------
+
+    def _on_press(self, event):
+        if not self._editable or self._view is None:
+            return
+        self.focus_set()
+        hit = self._hit(event.x, event.y)
+        if hit:
+            self._drag = {"mode": hit, "roi0": dict(self._roi),
+                          "origin": self._to_image(event.x, event.y)}
+        elif self._locked_size is not None:
+            # Locked: drop the box where they pointed and let the same gesture
+            # nudge it, rather than making them draw a box that cannot resize.
+            pt = self._to_image(event.x, event.y)
+            self._roi = self._place_locked(*pt)
+            self._drag = {"mode": "move", "roi0": dict(self._roi), "origin": pt}
+            self._redraw()
+            self._notify()
+        else:
+            anchor = self._to_image(event.x, event.y)
+            self._drag = {"mode": "new", "anchor": anchor, "cursor": anchor}
+            self._roi = None
+            self._redraw()
+
+    def _on_drag(self, event):
+        if not self._drag:
+            return
+        pt = self._to_image(event.x, event.y)
+        mode = self._drag["mode"]
+
+        if mode == "new":
+            self._drag["cursor"] = pt
+        elif mode == "move":
+            r0 = self._drag["roi0"]
+            ox_, oy_ = self._drag["origin"]
+            ih, iw = self._image.shape[:2]
+            nx = min(max(r0["x"] + pt[0] - ox_, 0), iw - r0["width"])
+            ny = min(max(r0["y"] + pt[1] - oy_, 0), ih - r0["height"])
+            self._roi = {"x": nx, "y": ny,
+                         "width": r0["width"], "height": r0["height"]}
+        else:
+            self._roi = self._resized(self._drag["roi0"], mode, pt)
+
+        self._redraw()
+        if mode != "new":
+            self._notify(final=False)
+
+    def _resized(self, r0, mode, pt):
+        left, top = r0["x"], r0["y"]
+        right, bottom = r0["x"] + r0["width"], r0["y"] + r0["height"]
+        px, py = pt
+        if "n" in mode:
+            top = min(py, bottom - self.MIN_ROI)
+        if "s" in mode:
+            bottom = max(py, top + self.MIN_ROI)
+        if "w" in mode:
+            left = min(px, right - self.MIN_ROI)
+        if "e" in mode:
+            right = max(px, left + self.MIN_ROI)
+        return {"x": int(left), "y": int(top),
+                "width": int(right - left), "height": int(bottom - top)}
+
+    def _on_release(self, event):
+        if not self._drag:
+            return
+        if self._drag["mode"] == "new":
+            (ax, ay), (bx, by) = self._drag["anchor"], self._drag["cursor"]
+            x, y = min(ax, bx), min(ay, by)
+            w, h = abs(bx - ax), abs(by - ay)
+            self._roi = ({"x": x, "y": y, "width": w, "height": h}
+                         if w >= self.MIN_ROI and h >= self.MIN_ROI else None)
+        self._drag = None
+        self._redraw()
+        self._notify()
+
+    def _notify(self, final=True):
+        """`final` is False for the intermediate states of a drag, so listeners
+        can keep cheap readouts live but defer expensive redraws to the release."""
+        if self._on_change:
+            self._on_change(self.get_roi(), final)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ORPHAN = "!unmapped:"
 
 
 class VisionSettings:
-    """Camera, inspection defaults, teaching and testing on one page."""
+    """The page as a console: title bar, footer, and the page between them."""
 
     def __init__(self, root):
         self.root = root
         ui.apply(root)
         self.root.title("EOL Tester - Vision Settings")
-        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
 
-        self.controller = VisionController()
-
-        self.stream = None          # live camera stream while the view is on
-        self.preview_job = None
-        self.poll_job = None
-        self.test_thread = None
-        self.test_result = None
-
-        # What the picture shows: 'idle', 'live', 'reference' or 'result'.
-        self.mode = 'idle'
-        self.photo = None
-        # (scale, x offset, y offset, image width, image height) of the
-        # picture as last drawn, to turn mouse positions into pixels.
-        self.view = None
-        self.drag_start = None
-
-        # Reference images being taught: {'image': frame, 'roi': dict or None}
-        self.references = []
-
+        # The footer is packed before the body so it keeps the foot of the window.
         ui.page_header(root, "Vision Settings")
         ui.footer_bar(root)
+        render(root)
 
-        body = tk.Frame(root, bg=ui.APP_BG)
-        body.pack(fill='both', expand=True)
-        body.grid_columnconfigure(0, weight=2, uniform='vision')
-        body.grid_columnconfigure(1, weight=3, uniform='vision')
-        body.grid_rowconfigure(0, weight=1)
 
-        left = ui.scrollable(body)
-        left.grid(row=0, column=0, sticky='nsew')
-        self.build_camera_card(left.body)
-        self.build_inspection_card(left.body)
-        self.build_parts_card(left.body)
-        tk.Frame(left.body, bg=ui.APP_BG, height=ui.PAD_LARGE).pack(fill='x')
+def render(parent):
+    """Render the Vision Settings page."""
+    from vision_engine.vision_controller import (
+        VisionController, load_vision_config, save_vision_config,
+        DEFAULT_MATCH_THRESHOLD,
+    )
 
-        right = tk.Frame(body, bg=ui.APP_BG)
-        right.grid(row=0, column=1, sticky='nsew')
-        # Teaching is packed first, from the foot, so a short screen takes
-        # its height from the picture rather than pushing the card off.
-        self.build_teach_card(right)
-        self.build_view_card(right)
+    v_cfg = load_vision_config()
+    ctrl = VisionController()
+    alive = {"page": True}
 
-        self.load_part_numbers()
-        self.refresh_parts()
-        self.show_message("Start the live view, or add a saved image, to teach a part.",
-                          'idle')
+    content = tk.Frame(parent, bg=BG)
+    content.pack(fill="both", expand=True, padx=18, pady=14)
+    content.columnconfigure(0, weight=1)
+    content.rowconfigure(2, weight=1)
 
-    # ------------------------------------------------------------------
-    # Layout
-    # ------------------------------------------------------------------
+    # ── Header ─────────────────────────────────────────────────────────────
+    header = tk.Frame(content, bg=BG)
+    header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
-    def card(self, parent, title, icon=None, expand=False, side='top'):
-        """A titled rounded card. Returns the frame to fill."""
-        card = ui.ctk_card(parent)
-        card.pack(side=side, fill='both' if expand else 'x', expand=expand,
-                  padx=ui.PAD_LARGE,
-                  pady=(ui.PAD_LARGE, ui.PAD_LARGE if side == 'bottom' else 0))
-        ui.ctk_card_header(card, title, icon=icon)
+    tk.Label(header, text="Part-presence verification by template matching "
+                          "(normalised cross-correlation)",
+             bg=BG, fg=TXT_DIM, font=(FONT, 11)).pack(side="left")
 
-        inner = tk.Frame(card, bg=ui.SURFACE)
-        inner.pack(fill='both', expand=True, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
-        return inner
+    pill = tk.Frame(header, bg=ui.SUBTLE, padx=12, pady=7,
+                    highlightthickness=1, highlightbackground=LINE)
+    pill.pack(side="right")
+    pill_dot = tk.Label(pill, text="●", bg=ui.SUBTLE, fg=TXT_FAINT, font=(FONT, 14))
+    pill_dot.pack(side="left", padx=(0, 7))
+    pill_txt = tk.Label(pill, text="Checking camera…", bg=ui.SUBTLE, fg=TXT_DIM,
+                        font=(FONT, 11, "bold"))
+    pill_txt.pack(side="left")
 
-    def label(self, parent, text, row, column=0):
-        tk.Label(parent, text=text, bg=ui.SURFACE, fg=ui.TEXT,
-                 font=ui.FONT_BODY_BOLD, anchor='e').grid(
-                     row=row, column=column, sticky='e',
-                     padx=(0, ui.PAD), pady=ui.PAD)
+    if not _cv2_ok or not _pil_ok:
+        missing = " and ".join(n for n, ok in
+                               (("opencv-python", _cv2_ok), ("Pillow", _pil_ok)) if not ok)
+        bar = tk.Frame(content, bg=ui.ROW_BAND)
+        bar.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        tk.Label(bar, text="  %s is not installed — vision is unavailable until it is."
+                           % missing, bg=ui.ROW_BAND, fg=TXT,
+                 font=(FONT, 11, "bold"), pady=6).pack(anchor="w")
 
-    def build_camera_card(self, parent):
-        form = self.card(parent, "CAMERA", icon='camera')
-        form.grid_columnconfigure(1, weight=1)
+    # ── Body: parts table + right rail ─────────────────────────────────────
+    body = tk.Frame(content, bg=BG)
+    body.grid(row=2, column=0, sticky="nsew")
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
 
-        self.label(form, "SOURCE:", 0)
-        self.source_var = tk.StringVar(
-            value=self.controller.config.get('camera_source', CAMERA_SOURCES[0]))
-        source = ttk.Combobox(form, textvariable=self.source_var, state='readonly',
-                              values=CAMERA_SOURCES, width=18)
-        source.grid(row=0, column=1, sticky='w', pady=ui.PAD)
-        source.bind('<<ComboboxSelected>>', lambda event: self.load_camera_fields())
+    parts_card = _card(body, "Taught Parts",
+                       "each part number maps to one template dataset", icon="list")
+    parts_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-        self.label(form, "DEVICE:", 1)
-        self.device_var = tk.StringVar()
-        self.device_box = ttk.Combobox(form, textvariable=self.device_var, width=18)
-        self.device_box.grid(row=1, column=1, sticky='w', pady=ui.PAD)
-        ui.ctk_button(form, "Find", icon='refresh', kind='neutral', width=90,
-                      command=self.find_devices).grid(row=1, column=2, padx=(ui.PAD, 0))
+    rail_scroll = ui.scrollable(body)
+    rail_scroll.configure(width=340)
+    rail_scroll.grid(row=0, column=1, sticky="ns")
+    rail_scroll.grid_propagate(False)
+    rail = rail_scroll.body
 
-        self.label(form, "RESOLUTION:", 2)
-        self.resolution_var = tk.StringVar()
-        ttk.Combobox(form, textvariable=self.resolution_var, values=RESOLUTIONS,
-                     width=18).grid(row=2, column=1, sticky='w', pady=ui.PAD)
+    # ── Parts table ────────────────────────────────────────────────────────
+    pb = parts_card.body
+    toolbar = tk.Frame(pb, bg=PANEL)
+    toolbar.pack(fill="x", pady=(0, 10))
 
-        ui.ctk_button(form, "Save Camera", icon='check', kind='success',
-                      command=self.save_camera).grid(
-                          row=3, column=0, columnspan=3, sticky='e', pady=(ui.PAD, 0))
+    table_wrap = tk.Frame(pb, bg=PANEL)
+    table_wrap.pack(fill="both", expand=True)
 
-        self.load_camera_fields()
+    cols = ("part", "file", "refs", "roi", "thresh", "taught", "status")
+    heads = {"part": ("PART NUMBER", 150, "w"), "file": ("MODEL FILE", 150, "w"),
+             "refs": ("REFS", 60, "center"), "roi": ("TEMPLATE", 115, "center"),
+             "thresh": ("THRESHOLD", 115, "center"),
+             "taught": ("TAUGHT", 185, "center"), "status": ("STATUS", 150, "w")}
 
-    def build_inspection_card(self, parent):
-        form = self.card(parent, "INSPECTION", icon='gear')
-        form.grid_columnconfigure(1, weight=1)
+    tree = ttk.Treeview(table_wrap, columns=cols, show="headings", selectmode="browse")
+    sb = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    tree.pack(fill="both", expand=True)
 
-        self.enabled_var = tk.BooleanVar(
-            value=bool(self.controller.config.get('vision_enabled', True)))
-        ttk.Checkbutton(form, text="Check parts with the camera during testing",
-                        variable=self.enabled_var).grid(
-                            row=0, column=0, columnspan=2, sticky='w', pady=ui.PAD)
+    for c in cols:
+        text, width, anchor = heads[c]
+        tree.heading(c, text=text)
+        tree.column(c, width=width, anchor=anchor,
+                    stretch=(c in ("part", "file", "status")))
 
-        self.label(form, "DEFAULT THRESHOLD:", 1)
-        self.threshold_var = tk.StringVar(value="{:.2f}".format(
-            self.controller.config.get('match_threshold', DEFAULT_MATCH_THRESHOLD)))
-        ttk.Spinbox(form, textvariable=self.threshold_var, from_=0.30, to=0.99,
-                    increment=0.01, format='%.2f', width=8).grid(
-                        row=1, column=1, sticky='w', pady=ui.PAD)
+    tree.tag_configure("ready", foreground=TXT)
+    tree.tag_configure("problem", foreground=WARN)
+    tree.tag_configure("empty", foreground=TXT_FAINT)
 
-        tk.Label(form, bg=ui.SURFACE, fg=ui.TEXT_MUTED, font=ui.FONT_SMALL,
-                 justify='left', anchor='w', wraplength=380,
-                 text="A part passes when its match score reaches the threshold. "
-                      "Each taught part keeps its own threshold; this one is "
-                      "used for parts taught from now on.").grid(
-                          row=2, column=0, columnspan=2, sticky='w')
+    # Contextual strip under the table: explains the selected row and carries
+    # the one action that only makes sense for unmapped files.
+    detail = tk.Frame(pb, bg=PANEL, height=34)
+    detail.pack(fill="x", pady=(8, 0))
+    detail.pack_propagate(False)
+    detail_lbl = tk.Label(detail, text="", bg=PANEL, fg=TXT_FAINT,
+                          font=(FONT, 11), anchor="w")
+    detail_lbl.pack(side="left", fill="x", expand=True)
+    btn_map = _btn(detail, "Map to Part…", BTN_PRIMARY, pady=3, font_size=10)
 
-        ui.ctk_button(form, "Save Inspection", icon='check', kind='success',
-                      command=self.save_inspection).grid(
-                          row=3, column=0, columnspan=2, sticky='e', pady=(ui.PAD, 0))
-
-    def build_parts_card(self, parent):
-        box = self.card(parent, "TAUGHT PARTS", icon='list')
-
-        columns = ('part', 'refs', 'threshold', 'created')
-        self.parts_tree = ttk.Treeview(box, columns=columns, show='headings',
-                                       height=7, selectmode='browse')
-        for column, heading, width in (('part', "PART NUMBER", 150),
-                                       ('refs', "REFS", 50),
-                                       ('threshold', "THRESHOLD", 90),
-                                       ('created', "TAUGHT ON", 150)):
-            self.parts_tree.heading(column, text=heading)
-            self.parts_tree.column(column, width=width,
-                                   anchor='w' if column == 'part' else 'center')
-        self.parts_tree.pack(fill='x')
-        self.parts_tree.bind('<<TreeviewSelect>>', lambda event: self.part_selected())
-
-        row = tk.Frame(box, bg=ui.SURFACE)
-        row.pack(fill='x', pady=(ui.PAD, 0))
-
-        tk.Label(row, text="THRESHOLD:", bg=ui.SURFACE, fg=ui.TEXT,
-                 font=ui.FONT_BODY_BOLD).pack(side='left')
-        self.part_threshold_var = tk.StringVar()
-        ttk.Spinbox(row, textvariable=self.part_threshold_var, from_=0.30, to=0.99,
-                    increment=0.01, format='%.2f', width=6).pack(
-                        side='left', padx=ui.PAD)
-        ui.ctk_button(row, "Set", kind='neutral', width=60,
-                      command=self.set_part_threshold).pack(side='left')
-
-        buttons = tk.Frame(box, bg=ui.SURFACE)
-        buttons.pack(fill='x', pady=(ui.PAD, 0))
-        ui.ctk_button(buttons, "Test", icon='play', kind='primary', width=110,
-                      command=self.test_part).pack(side='left')
-        ui.ctk_button(buttons, "Delete", icon='alert', kind='danger', width=110,
-                      command=self.delete_part).pack(side='right')
-
-    def build_view_card(self, parent):
-        box = self.card(parent, "LIVE VIEW", icon='camera', expand=True)
-
-        self.canvas = tk.Canvas(box, bg=ui.CHART_SURFACE, highlightthickness=1,
-                                highlightbackground=ui.BORDER, cursor='crosshair')
-        self.canvas.pack(fill='both', expand=True)
-        self.canvas.bind('<Configure>', lambda event: self.redraw())
-        self.canvas.bind('<ButtonPress-1>', self.box_start)
-        self.canvas.bind('<B1-Motion>', self.box_drag)
-        self.canvas.bind('<ButtonRelease-1>', self.box_end)
-
-        self.banner = ui.StatusBanner(box)
-        self.banner.pack(fill='x', pady=(ui.PAD, 0))
-
-        buttons = tk.Frame(box, bg=ui.SURFACE)
-        buttons.pack(fill='x', pady=(ui.PAD, 0))
-        self.live_button = ui.ctk_button(buttons, "Start Live View", icon='play',
-                                         kind='primary', width=170,
-                                         command=self.toggle_preview)
-        self.live_button.pack(side='left')
-        ui.ctk_button(buttons, "Capture Reference", icon='camera', kind='neutral',
-                      width=170, command=self.capture_reference).pack(
-                          side='left', padx=ui.PAD)
-        ui.ctk_button(buttons, "Add Image File", icon='document', kind='neutral',
-                      width=160, command=self.add_image_file).pack(side='left')
-
-    def build_teach_card(self, parent):
-        box = self.card(parent, "TEACH A PART", icon='box', side='bottom')
-        box.grid_columnconfigure(1, weight=1)
-
-        self.label(box, "PART NUMBER:", 0)
-        self.part_var = tk.StringVar()
-        self.part_box = ttk.Combobox(box, textvariable=self.part_var, width=24)
-        self.part_box.grid(row=0, column=1, sticky='w', pady=ui.PAD)
-
-        self.label(box, "REFERENCES:", 1)
-        self.reference_list = ttk.Treeview(box, columns=('size', 'box'),
-                                           show='tree headings', height=4,
-                                           selectmode='browse')
-        self.reference_list.heading('#0', text="IMAGE")
-        self.reference_list.heading('size', text="SIZE")
-        self.reference_list.heading('box', text="BOX")
-        self.reference_list.column('#0', width=120)
-        self.reference_list.column('size', width=100, anchor='center')
-        self.reference_list.column('box', width=100, anchor='center')
-        self.reference_list.tag_configure('boxed', foreground=ui.SUCCESS)
-        self.reference_list.tag_configure('unboxed', foreground=ui.DANGER)
-        self.reference_list.grid(row=1, column=1, sticky='ew', pady=ui.PAD)
-        self.reference_list.bind('<<TreeviewSelect>>',
-                                 lambda event: self.reference_selected())
-
-        side = tk.Frame(box, bg=ui.SURFACE)
-        side.grid(row=1, column=2, sticky='n', padx=(ui.PAD, 0), pady=ui.PAD)
-        ui.ctk_button(side, "Remove", kind='neutral', width=90,
-                      command=self.remove_reference).pack(fill='x')
-        ui.ctk_button(side, "Clear", kind='neutral', width=90,
-                      command=self.clear_references).pack(fill='x', pady=(ui.PAD, 0))
-
-        tk.Label(box, bg=ui.SURFACE, fg=ui.TEXT_MUTED, font=ui.FONT_SMALL,
-                 anchor='w', justify='left',
-                 text="Pick a reference, then drag a box around the part on the "
-                      "picture. Every reference needs its own box.").grid(
-                          row=2, column=0, columnspan=3, sticky='w')
-
-        ui.ctk_button(box, "Save Model", icon='check', kind='success', width=150,
-                      command=self.save_model).grid(
-                          row=3, column=0, columnspan=3, sticky='e', pady=(ui.PAD, 0))
-
-    # ------------------------------------------------------------------
-    # Messages
-    # ------------------------------------------------------------------
-
-    def show_message(self, text, level='info'):
-        self.banner.show(text, level)
-
-    # ------------------------------------------------------------------
-    # Camera
-    # ------------------------------------------------------------------
-
-    def load_camera_fields(self):
-        index, width, height = load_camera_config(self.source_var.get())
-        self.device_var.set('' if index < 0 else str(index))
-        self.resolution_var.set(f"{width}x{height}")
-
-    def camera_fields(self):
-        """(index, width, height) as typed, or None after saying what is wrong."""
-        try:
-            index = int(self.device_var.get())
-        except ValueError:
-            self.show_message("Choose a camera device first - press Find to list them.",
-                              'warning')
-            return None
-
-        try:
-            width, height = (int(part) for part in
-                             self.resolution_var.get().lower().split('x'))
-        except ValueError:
-            self.show_message("Resolution must look like 640x480.", 'warning')
-            return None
-
-        if index < 0 or width <= 0 or height <= 0:
-            self.show_message("Device and resolution must be positive numbers.",
-                              'warning')
-            return None
-        return index, width, height
-
-    def find_devices(self):
-        self.show_message("Looking for cameras...", 'info')
-        self.root.update_idletasks()
-        found = camera.probe()
-        self.device_box['values'] = [str(index) for index in found]
-        if not found:
-            self.show_message("No camera found. Check that it is plugged in.",
-                              'danger')
+    def _refresh_table(select=None):
+        if not alive["page"]:
             return
-        if self.device_var.get() not in self.device_box['values']:
-            self.device_var.set(str(found[0]))
-        self.show_message("Found camera device(s): {}.".format(
-            ", ".join(str(index) for index in found)), 'success')
+        remembered = select or (tree.selection()[0] if tree.selection() else None)
+        tree.delete(*tree.get_children())
+        ctrl.reload_config()
 
-    def save_camera(self):
-        fields = self.camera_fields()
-        if fields is None:
-            return
-
-        source = self.source_var.get()
-        try:
-            save_camera_config(source, *fields)
-            self.controller.config['camera_source'] = source
-            save_vision_config(self.controller.config)
-        except OSError as e:
-            messagebox.showerror("Vision Settings", f"Could not save the camera:\n\n{e}")
-            return
-
-        self.controller.reload_config()
-        # A running view keeps the device and size it was opened with.
-        if self.stream is not None:
-            self.stop_preview()
-            self.start_preview()
-        self.show_message(f"Camera saved: {source} is device {fields[0]} "
-                          f"at {fields[1]}x{fields[2]}.", 'success')
-
-    def toggle_preview(self):
-        if self.stream is None:
-            self.start_preview()
-        elif self.mode != 'live':
-            # A reference or a test result is on show over the running view.
-            self.clear_reference_selection()
-            self.mode = 'live'
-            self.live_button.configure(text="Stop Live View")
-            self.show_message("Live view on.", 'success')
-        else:
-            self.stop_preview()
-            self.mode = 'idle'
-            self.redraw()
-            self.show_message("Live view stopped.", 'idle')
-
-    def start_preview(self):
-        fields = self.camera_fields()
-        if fields is None:
-            return
-
-        stream = camera.acquire(*fields)
-        if stream is None or not stream.wait_until_open(timeout=5.0):
-            if stream is not None:
-                stream.release()
-            self.show_message(f"Camera device {fields[0]} could not be opened.",
-                              'danger')
-            return
-
-        self.stream = stream
-        self.mode = 'live'
-        self.clear_reference_selection()
-        self.live_button.configure(text="Stop Live View",
-                                   image=ui.icon_image('power', ui.TEXT_ON_ACCENT, 20))
-        self.show_message("Live view on.", 'success')
-        self.preview_tick()
-
-    def stop_preview(self):
-        if self.preview_job is not None:
-            self.root.after_cancel(self.preview_job)
-            self.preview_job = None
-        if self.stream is not None:
-            self.stream.release()
-            self.stream = None
-        if self.live_button.winfo_exists():
-            self.live_button.configure(text="Start Live View",
-                                       image=ui.icon_image('play', ui.TEXT_ON_ACCENT, 20))
-
-    def preview_tick(self):
-        self.preview_job = None
-        if self.stream is None:
-            return
-
-        if not self.stream.is_alive():
-            self.stop_preview()
-            self.mode = 'idle'
-            self.redraw()
-            self.show_message("The camera stopped sending pictures.", 'danger')
-            return
-
-        if self.mode == 'live':
-            frame = self.stream.latest()
-            if frame is not None:
-                self.draw(frame)
-
-        self.preview_job = self.root.after(PREVIEW_MS, self.preview_tick)
-
-    # ------------------------------------------------------------------
-    # Picture
-    # ------------------------------------------------------------------
-
-    def draw(self, frame, boxes=()):
-        """Fit a BGR frame to the canvas and draw (box, colour) pairs over it."""
-        width = max(self.canvas.winfo_width(), 1)
-        height = max(self.canvas.winfo_height(), 1)
-        image_h, image_w = frame.shape[:2]
-        scale = min(width / image_w, height / image_h)
-        shown_w = max(int(image_w * scale), 1)
-        shown_h = max(int(image_h * scale), 1)
-        left = (width - shown_w) // 2
-        top = (height - shown_h) // 2
-
-        if frame.ndim == 2:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-        else:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        picture = Image.fromarray(rgb).resize((shown_w, shown_h))
-        self.photo = ImageTk.PhotoImage(picture)
-
-        self.canvas.delete('all')
-        self.canvas.create_image(left, top, image=self.photo, anchor='nw')
-        self.view = (scale, left, top, image_w, image_h)
-
-        for box, colour in boxes:
-            self.draw_box(box, colour)
-
-    def draw_box(self, box, colour, tag=None):
-        scale, left, top, _, _ = self.view
-        x, y, w, h = box
-        self.canvas.create_rectangle(left + x * scale, top + y * scale,
-                                     left + (x + w) * scale, top + (y + h) * scale,
-                                     outline=colour, width=3, tags=tag)
-
-    def redraw(self):
-        """Draw again whatever the picture is meant to be showing."""
-        if self.mode == 'reference':
-            self.show_reference()
-        elif self.mode == 'result' and self.test_result is not None:
-            self.show_result(self.test_result)
-        elif self.mode == 'live' and self.stream is not None:
-            frame = self.stream.latest()
-            if frame is not None:
-                self.draw(frame)
-        else:
-            self.view = None
-            self.canvas.delete('all')
-            self.canvas.create_text(
-                self.canvas.winfo_width() // 2, self.canvas.winfo_height() // 2,
-                text="No picture", fill=ui.CHART_TEXT, font=ui.FONT_SECTION)
-
-    def to_image(self, event):
-        """Canvas position to a pixel of the picture shown, kept inside it."""
-        scale, left, top, image_w, image_h = self.view
-        x = int(round((event.x - left) / scale))
-        y = int(round((event.y - top) / scale))
-        return min(max(x, 0), image_w), min(max(y, 0), image_h)
-
-    # ------------------------------------------------------------------
-    # References and boxes
-    # ------------------------------------------------------------------
-
-    def refresh_reference_list(self, select=None):
-        self.reference_list.delete(*self.reference_list.get_children())
-        for index, reference in enumerate(self.references):
-            image_h, image_w = reference['image'].shape[:2]
-            boxed = bool(reference['roi'])
-            self.reference_list.insert(
-                '', 'end', iid=str(index), text=f"Reference {index + 1}",
-                values=(f"{image_w}x{image_h}", "set" if boxed else "not set"),
-                tags=('boxed' if boxed else 'unboxed',))
-        if select is not None and 0 <= select < len(self.references):
-            self.reference_list.selection_set(str(select))
-            self.reference_list.see(str(select))
-
-    def clear_reference_selection(self):
-        self.reference_list.selection_remove(*self.reference_list.selection())
-
-    def selected_reference(self):
-        selection = self.reference_list.selection()
-        return int(selection[0]) if selection else None
-
-    def add_reference(self, image):
-        self.references.append({'image': image, 'roi': None})
-        index = len(self.references) - 1
-        self.refresh_reference_list(select=index)
-        self.reference_selected()
-
-    def capture_reference(self):
-        if self.stream is None:
-            self.show_message("Start the live view first, then capture.", 'warning')
-            return
-        frame = self.stream.latest()
-        if frame is None:
-            self.show_message("The camera has not sent a picture yet.", 'warning')
-            return
-        self.add_reference(frame)
-
-    def add_image_file(self):
-        paths = filedialog.askopenfilenames(
-            parent=self.root, title="Add reference images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
-        for path in paths:
-            # imdecode rather than imread, which cannot open paths that are
-            # not plain ASCII on Windows.
-            image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                self.show_message(f"Not an image: {os.path.basename(path)}", 'danger')
-                continue
-            self.add_reference(image)
-
-    def reference_selected(self):
-        if self.selected_reference() is None:
-            return
-        self.mode = 'reference'
-        if self.stream is not None:
-            self.live_button.configure(text="Back to Live View")
-        self.show_reference()
-        self.show_message("Drag a box around the part on this reference.", 'info')
-
-    def show_reference(self):
-        index = self.selected_reference()
-        if index is None:
-            self.mode = 'live' if self.stream is not None else 'idle'
-            self.redraw()
-            return
-        reference = self.references[index]
-        roi = reference['roi']
-        boxes = ()
-        if roi:
-            boxes = (((roi['x'], roi['y'], roi['width'], roi['height']), BOX_TAUGHT),)
-        self.draw(reference['image'], boxes)
-
-    def remove_reference(self):
-        index = self.selected_reference()
-        if index is None:
-            return
-        del self.references[index]
-        self.refresh_reference_list(select=min(index, len(self.references) - 1))
-        self.show_reference()
-
-    def clear_references(self):
-        if self.references and not messagebox.askyesno(
-                "Vision Settings", "Remove every reference image?", parent=self.root):
-            return
-        self.references = []
-        self.refresh_reference_list()
-        self.show_reference()
-
-    def box_start(self, event):
-        if self.mode != 'reference' or self.view is None:
-            return
-        self.drag_start = self.to_image(event)
-
-    def box_drag(self, event):
-        if self.drag_start is None:
-            return
-        x0, y0 = self.drag_start
-        x1, y1 = self.to_image(event)
-        self.canvas.delete('drawing')
-        self.draw_box((min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)),
-                      BOX_DRAWING, tag='drawing')
-
-    def box_end(self, event):
-        if self.drag_start is None:
-            return
-        x0, y0 = self.drag_start
-        x1, y1 = self.to_image(event)
-        self.drag_start = None
-
-        index = self.selected_reference()
-        if index is None:
-            return
-
-        roi = {'x': min(x0, x1), 'y': min(y0, y1),
-               'width': abs(x1 - x0), 'height': abs(y1 - y0)}
-        if roi['width'] < MIN_BOX or roi['height'] < MIN_BOX:
-            self.show_reference()
-            self.show_message("That box is too small - drag a larger one.", 'warning')
-            return
-
-        self.references[index]['roi'] = roi
-        self.refresh_reference_list(select=index)
-        self.show_reference()
-        self.show_message(f"Box set on reference {index + 1}: "
-                          f"{roi['width']}x{roi['height']} pixels.", 'success')
-
-    # ------------------------------------------------------------------
-    # Settings, models and tests
-    # ------------------------------------------------------------------
-
-    def read_threshold(self, variable):
-        try:
-            value = float(variable.get())
-        except ValueError:
-            value = -1
-        if not 0.0 < value < 1.0:
-            self.show_message("A threshold is a number between 0 and 1, such as 0.75.",
-                              'warning')
-            return None
-        return round(value, 2)
-
-    def save_inspection(self):
-        threshold = self.read_threshold(self.threshold_var)
-        if threshold is None:
-            return
-        self.controller.config['vision_enabled'] = bool(self.enabled_var.get())
-        self.controller.config['match_threshold'] = threshold
-        try:
-            save_vision_config(self.controller.config)
-        except OSError as e:
-            messagebox.showerror("Vision Settings",
-                                 f"Could not save the inspection settings:\n\n{e}")
-            return
-        self.show_message("Inspection settings saved.", 'success')
-
-    def load_part_numbers(self):
-        """Part numbers from the model master, plus any already taught."""
-        parts = set(self.controller.get_mapped_parts())
-        try:
-            conn = db.connect()
-            cursor = conn.cursor()
-            cursor.execute("SELECT MM_PART_NUMBER FROM TBL_MODEL_MASTER "
-                           "ORDER BY MM_PART_NUMBER")
-            parts.update(row[0] for row in cursor.fetchall() if row[0])
-            cursor.close()
-            conn.close()
-        except Exception as e:
-            # Teaching still works without the database: a part number can
-            # be typed in.
-            print(f"Vision Settings: could not read part numbers: {e}")
-        self.part_box['values'] = sorted(parts)
-
-    def refresh_parts(self, select=None):
-        self.parts_tree.delete(*self.parts_tree.get_children())
-        for part in sorted(self.controller.get_mapped_parts()):
-            info = self.controller.model_info(part)
+        mapped_files = set()
+        for pno, filename in sorted(ctrl.get_mapped_parts().items()):
+            mapped_files.add(filename)
+            info = ctrl.model_info(pno)
             if info is None:
-                values = (part, '-', '-', "model file missing")
+                tree.insert("", "end", iid=pno, tags=("problem",),
+                            values=(pno, filename, "—", "—", "—", "—", "FILE MISSING"))
             else:
-                values = (part, info['references'],
-                          "{:.2f}".format(info['threshold']),
-                          str(info['created']).replace('T', ' '))
-            self.parts_tree.insert('', 'end', iid=part, values=values)
-        if select is not None and self.parts_tree.exists(select):
-            self.parts_tree.selection_set(select)
-            self.parts_tree.see(select)
+                tw, th = info["template_size"]
+                sizes = ("%d x %d" % (tw, th) if info["uniform_templates"]
+                         else "varied (%d)" % len(set(info["template_sizes"])))
+                # A threshold this low passes almost any frame, so the part looks
+                # guarded while nothing is really being checked. Say so.
+                weak = info["threshold"] < 0.55
+                tree.insert("", "end", iid=pno, tags=("problem" if weak else "ready",),
+                            values=(pno, filename, info["references"],
+                                    sizes,
+                                    "%.2f" % info["threshold"],
+                                    str(info["created"]).replace("T", "  "),
+                                    "Threshold too low" if weak else "Ready"))
 
-    def selected_part(self):
-        selection = self.parts_tree.selection()
-        return selection[0] if selection else None
+        # Files on disk that no part number resolves to. Production cannot reach
+        # these, so surface them rather than letting them look installed.
+        if os.path.isdir(_MODELS_DIR):
+            for f in sorted(os.listdir(_MODELS_DIR)):
+                if f.endswith(".npz") and f not in mapped_files:
+                    tree.insert("", "end", iid=_ORPHAN + f, tags=("problem",),
+                                values=("—", f, "—", "—", "—", "—", "NOT MAPPED"))
 
-    def part_selected(self):
-        part = self.selected_part()
-        if part is None:
+        if not tree.get_children():
+            tree.insert("", "end", iid="!none", tags=("empty",),
+                        values=("—", "No parts taught yet", "", "", "", "",
+                                "Start with “Teach New Part”"))
+
+        if remembered and tree.exists(remembered):
+            tree.selection_set(remembered)
+            tree.see(remembered)
+        _on_select()
+        _refresh_coverage()
+
+    def _selection():
+        """(kind, value) where kind is 'part', 'orphan' or None."""
+        sel = tree.selection()
+        if not sel or sel[0] == "!none":
+            return None, None
+        if sel[0].startswith(_ORPHAN):
+            return "orphan", sel[0][len(_ORPHAN):]
+        return "part", sel[0]
+
+    # ── Right rail: camera ─────────────────────────────────────────────────
+    cam_card = _card(rail, "Camera", icon="camera")
+    cam_card.pack(fill="x", padx=(0, 6))
+    cb = cam_card.body
+    cam_device = _kv_row(cb, "Device", "—", mono=True)
+    cam_res = _kv_row(cb, "Resolution", "—", mono=True)
+    cam_state = _kv_row(cb, "State", "Checking…", value_fg=TXT_DIM)
+
+    cam_btns = tk.Frame(cb, bg=PANEL)
+    cam_btns.pack(fill="x", pady=(10, 0))
+    btn_cam_cfg = _btn(cam_btns, "Configure…", BTN_NEUTRAL, icon="gear")
+    btn_cam_cfg.pack(side="left")
+    btn_cam_check = _btn(cam_btns, "Re-check", BTN_NEUTRAL, icon="refresh")
+    btn_cam_check.pack(side="left", padx=(6, 0))
+
+    def _paint_camera(state_text, color, dot_color=None):
+        if not alive["page"]:
             return
-        info = self.controller.model_info(part)
-        if info is not None:
-            self.part_threshold_var.set("{:.2f}".format(info['threshold']))
+        cam_state.config(text=state_text, fg=color)
+        pill_txt.config(text=state_text, fg=color)
+        pill_dot.config(fg=dot_color or color)
 
-    def save_model(self):
-        part = self.part_var.get().strip()
-        if not part:
-            self.show_message("Enter the part number to teach.", 'warning')
-            return
-        if not self.references:
-            self.show_message("Add at least one reference image first.", 'warning')
-            return
+    def _refresh_camera():
+        cam = _load_cam_cfg()
+        idx, w, h = cam["index"], cam["width"], cam["height"]
+        configured = cam["enabled"] and idx >= 0
+        cam_device.config(text=("Camera %d" % idx) if configured else "Not configured",
+                          fg=TXT if configured else TXT_FAINT)
+        cam_res.config(text="%d x %d" % (w, h) if configured else "—",
+                       fg=TXT if configured else TXT_FAINT)
 
-        missing = [str(n) for n, reference in enumerate(self.references, start=1)
-                   if not reference['roi']]
-        if missing:
-            self.show_message("Draw a box on reference {} first.".format(
-                ", ".join(missing)), 'warning')
+        if not _cv2_ok:
+            _paint_camera("OpenCV missing", NG_RED)
             return
-
-        if self.controller.has_model(part) and not messagebox.askyesno(
-                "Vision Settings",
-                f"{part} is already taught. Replace its model?", parent=self.root):
+        if not configured:
+            _paint_camera("No camera configured", WARN)
             return
+        _paint_camera("Checking camera…", TXT_DIM)
 
-        threshold = self.read_threshold(self.threshold_var)
-        if threshold is None:
+        def _work():
+            try:
+                status = ctrl.get_status()
+            except Exception:
+                status = "CAMERA_ERROR"
+            text, color = {
+                "READY": ("Camera %d ready" % idx, OK_GREEN),
+                "NO_CAMERA": ("No camera configured", WARN),
+            }.get(status, ("Camera %d not responding" % idx, NG_RED))
+            try:
+                if alive["page"]:
+                    parent.after(0, lambda: _paint_camera(text, color))
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    btn_cam_check.configure(command=lambda: _refresh_camera())
+
+    def _configure_camera():
+        if _open_camera_dialog(parent):
+            ctrl.reload_config()
+            _refresh_camera()
+
+    btn_cam_cfg.configure(command=_configure_camera)
+
+    # ── Right rail: part coverage ────────────────────────────────────────────
+    # The parts table audits datasets — files that exist and whether they're
+    # wired up. This audits the other direction: real parts in the master that
+    # the line will build with no vision dataset at all, which is the actual
+    # production exposure, not a stray file on disk.
+    cov_card = _card(rail, "Part Coverage", icon="clipboard")
+    cov_card.pack(fill="x", padx=(0, 6), pady=(12, 0))
+    cvb = cov_card.body
+    tk.Label(cvb, text="Parts in the model master with no vision dataset.",
+             bg=PANEL, fg=TXT_FAINT, font=(FONT, 10), anchor="w", justify="left",
+             wraplength=265).pack(fill="x")
+    cov_summary = tk.Label(cvb, text="Checking…", bg=PANEL, fg=TXT_DIM,
+                           font=(FONT, 11, "bold"), anchor="w")
+    cov_summary.pack(fill="x", pady=(4, 0))
+    cov_list = tk.Listbox(cvb, font=(MONO, 11), height=6,
+                          selectmode="browse", activestyle="none")
+    cov_list.pack(fill="x", pady=(6, 0))
+
+    def _refresh_coverage():
+        if not alive["page"]:
             return
+        master_parts = _fetch_master_parts()
+        cov_list.delete(0, "end")
+        if master_parts is None:
+            cov_summary.config(text="Model master unreachable", fg=WARN)
+            cov_list.insert("end", "  Could not reach the database.")
+            return
+        if not master_parts:
+            cov_summary.config(text="No parts in the master yet", fg=TXT_FAINT)
+            return
+        mapped = set(ctrl.get_mapped_parts())
+        missing = [pno for pno, _ in master_parts if pno not in mapped]
+        covered = len(master_parts) - len(missing)
+        cov_summary.config(text="%d of %d parts have vision" % (covered, len(master_parts)),
+                           fg=OK_GREEN if not missing else WARN)
+        for pno in missing:
+            cov_list.insert("end", "  " + pno)
 
+    # ── Right rail: inspection settings ────────────────────────────────────
+    insp_card = _card(rail, "Inspection", icon="gear")
+    insp_card.pack(fill="x", padx=(0, 6), pady=(12, 0))
+    ib = insp_card.body
+
+    enabled_var = tk.BooleanVar(value=v_cfg.get("vision_enabled", True))
+    thresh_var = tk.DoubleVar(
+        value=float(v_cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)))
+    initial = (enabled_var.get(), round(thresh_var.get(), 2))
+
+    ttk.Checkbutton(ib, text="Vision enabled", variable=enabled_var).pack(fill="x")
+    tk.Label(ib, text="When off, the test cycle skips vision entirely.",
+             bg=PANEL, fg=TXT_FAINT, font=(FONT, 10), anchor="w",
+             wraplength=265, justify="left").pack(fill="x", padx=(22, 0), pady=(0, 12))
+
+    tk.Frame(ib, bg=LINE, height=1).pack(fill="x", pady=(0, 12))
+
+    th_head = tk.Frame(ib, bg=PANEL)
+    th_head.pack(fill="x")
+    tk.Label(th_head, text="Default match threshold", bg=PANEL, fg=TXT,
+             font=(FONT, 11, "bold")).pack(side="left")
+    th_val = tk.Label(th_head, text="0.75", bg=PANEL, fg=ACCENT,
+                      font=(MONO, 14, "bold"))
+    th_val.pack(side="right")
+
+    scale = ttk.Scale(ib, from_=0.40, to=0.99, orient="horizontal",
+                      variable=thresh_var)
+    scale.pack(fill="x", pady=(6, 2))
+
+    ticks = tk.Frame(ib, bg=PANEL)
+    ticks.pack(fill="x")
+    tk.Label(ticks, text="lenient", bg=PANEL, fg=TXT_FAINT,
+             font=(FONT, 10)).pack(side="left")
+    tk.Label(ticks, text="strict", bg=PANEL, fg=TXT_FAINT,
+             font=(FONT, 10)).pack(side="right")
+
+    th_caption = tk.Label(ib, text="", bg=PANEL, fg=TXT_DIM, font=(FONT, 10),
+                          wraplength=265, justify="left", anchor="w")
+    th_caption.pack(fill="x", pady=(8, 0))
+
+    tk.Label(ib, text="Applies to parts taught from now on. Each taught part keeps "
+                      "the threshold it was saved with — change one from the table.",
+             bg=PANEL, fg=TXT_FAINT, font=(FONT, 10), wraplength=265,
+             justify="left", anchor="w").pack(fill="x", pady=(8, 0))
+
+    save_row = tk.Frame(ib, bg=PANEL)
+    save_row.pack(fill="x", pady=(12, 0))
+    btn_save = _btn(save_row, "Save Settings", BTN_PRIMARY, icon="check")
+    btn_save.pack(side="right")
+    dirty_lbl = tk.Label(save_row, text="", bg=PANEL, fg=WARN, font=(FONT, 11, "bold"))
+    dirty_lbl.pack(side="left")
+
+    tk.Frame(rail, bg=BG, height=12).pack(fill="x")
+
+    def _on_settings_change(*_a):
+        val = round(thresh_var.get(), 2)
+        th_val.config(text="%.2f" % val)
+        caption, color = _threshold_caption(val)
+        th_caption.config(text=caption, fg=color)
+        changed = (enabled_var.get(), val) != initial
+        dirty_lbl.config(text="Unsaved changes" if changed else "", fg=WARN)
+        _set_btn_enabled(btn_save, changed)
+
+    thresh_var.trace_add("write", _on_settings_change)
+    enabled_var.trace_add("write", _on_settings_change)
+
+    def _save_settings():
+        nonlocal initial
+        val = round(thresh_var.get(), 2)
+        v_cfg.update(load_vision_config())     # keep what the dialogs saved
+        v_cfg["vision_enabled"] = enabled_var.get()
+        v_cfg["match_threshold"] = val
         try:
-            self.controller.build_and_save_model(
-                part, [reference['image'] for reference in self.references],
-                [reference['roi'] for reference in self.references],
-                match_threshold=threshold)
-        except (ValueError, OSError) as e:
-            self.show_message(f"Model not saved: {e}", 'danger')
-            return
-
-        self.references = []
-        self.refresh_reference_list()
-        self.load_part_numbers()
-        self.refresh_parts(select=part)
-        self.mode = 'live' if self.stream is not None else 'idle'
-        self.redraw()
-        self.show_message(f"{part} taught and saved.", 'success')
-
-    def set_part_threshold(self):
-        part = self.selected_part()
-        if part is None:
-            self.show_message("Choose a taught part first.", 'warning')
-            return
-        threshold = self.read_threshold(self.part_threshold_var)
-        if threshold is None:
-            return
-        try:
-            self.controller.set_model_threshold(part, threshold)
-        except (ValueError, OSError, KeyError) as e:
-            self.show_message(f"Threshold not changed: {e}", 'danger')
-            return
-        self.refresh_parts(select=part)
-        self.show_message(f"{part} now passes at {threshold:.2f}.", 'success')
-
-    def delete_part(self):
-        part = self.selected_part()
-        if part is None:
-            self.show_message("Choose a taught part first.", 'warning')
-            return
-        if not messagebox.askyesno(
-                "Vision Settings",
-                f"Delete the vision model for {part}?\n\n"
-                "It will no longer be checked by the camera until it is taught again.",
-                parent=self.root):
-            return
-        try:
-            self.controller.delete_model(part)
+            save_vision_config(v_cfg)
         except OSError as e:
-            self.show_message(f"Model not deleted: {e}", 'danger')
+            messagebox.showerror("Vision Settings", "Could not save:\n\n%s" % e,
+                                 parent=parent)
             return
-        self.refresh_parts()
-        self.show_message(f"Vision model for {part} deleted.", 'success')
+        ctrl.reload_config()
+        initial = (enabled_var.get(), val)
+        _set_btn_enabled(btn_save, False)
+        dirty_lbl.config(text="Saved", fg=OK_GREEN)
+        parent.after(1800, lambda: dirty_lbl.config(text="", fg=WARN)
+                     if alive["page"] else None)
 
-    def test_part(self):
-        """Judge a picture against the selected part, as the Test console would."""
-        part = self.selected_part()
-        if part is None:
-            self.show_message("Choose a taught part to test.", 'warning')
+    btn_save.configure(command=_save_settings)
+    _on_settings_change()
+
+    # ── Row actions ────────────────────────────────────────────────────────
+
+    def _teach(part_number=None):
+        cam = _load_cam_cfg()
+        saved = _open_teach_wizard(parent, cam, part_number)
+        if saved:
+            _refresh_table(select=saved)
+
+    def _reteach():
+        kind, value = _selection()
+        if kind == "part":
+            _teach(value)
+
+    def _run_test():
+        kind, value = _selection()
+        if kind == "part" and ctrl.model_info(value) is not None:
+            _open_test_dialog(parent, ctrl, value, on_changed=_refresh_table)
+
+    def _set_threshold():
+        kind, value = _selection()
+        if kind != "part":
             return
-        if self.test_thread is not None:
+        info = ctrl.model_info(value)
+        if info is None:
+            return
+        if _open_threshold_dialog(parent, ctrl, value, info["threshold"]):
+            _refresh_table(select=value)
+
+    def _map_orphan():
+        kind, filename = _selection()
+        if kind != "orphan":
+            return
+        pno = _prompt_part_number(
+            parent, "Map Model File",
+            "Part number that should use “%s”:" % filename,
+            taken=set(ctrl.get_mapped_parts()))
+        if not pno:
+            return
+        try:
+            ctrl.map_model_file(pno, filename)
+        except ValueError as e:
+            messagebox.showerror("Map Model", str(e), parent=parent)
+            return
+        _refresh_table(select=pno)
+
+    def _delete():
+        kind, value = _selection()
+        if kind == "orphan":
+            if not messagebox.askyesno(
+                    "Delete Model File",
+                    "Permanently delete the unmapped file “%s”?" % value,
+                    parent=parent):
+                return
+            try:
+                os.remove(os.path.join(_MODELS_DIR, value))
+            except OSError as e:
+                messagebox.showerror("Delete", str(e), parent=parent)
+                return
+        elif kind == "part":
+            if not messagebox.askyesno(
+                    "Delete Dataset",
+                    "Delete the vision dataset for part “%s”?\n\n"
+                    "The part will no longer be checked by vision on the line."
+                    % value, parent=parent):
+                return
+            ctrl.delete_model(value)
+        else:
+            return
+        _refresh_table()
+
+    btn_teach = _btn(toolbar, "Teach New Part", BTN_SUCCESS, icon="box",
+                     command=lambda: _teach(None), pady=7)
+    btn_teach.pack(side="left")
+    btn_reteach = _btn(toolbar, "Re-teach", BTN_NEUTRAL, icon="refresh",
+                       command=_reteach, pady=7)
+    btn_reteach.pack(side="left", padx=(8, 0))
+    btn_test = _btn(toolbar, "Run Test", BTN_PRIMARY, icon="play",
+                    command=_run_test, pady=7)
+    btn_test.pack(side="left", padx=(8, 0))
+    btn_thresh = _btn(toolbar, "Threshold…", BTN_NEUTRAL, icon="ruler",
+                      command=_set_threshold, pady=7)
+    btn_thresh.pack(side="left", padx=(8, 0))
+    btn_del = _btn(toolbar, "Delete", BTN_DANGER, icon="alert",
+                   command=_delete, pady=7)
+    btn_del.pack(side="left", padx=(8, 0))
+    btn_map.configure(command=_map_orphan)
+
+    def _on_select(event=None):
+        kind, value = _selection()
+        is_part = kind == "part"
+        info = ctrl.model_info(value) if is_part else None
+        usable = info is not None
+        for b, on in ((btn_reteach, is_part), (btn_test, usable),
+                      (btn_thresh, usable), (btn_del, kind is not None)):
+            _set_btn_enabled(b, on)
+
+        if kind == "orphan":
+            detail_lbl.config(
+                text="Not mapped to any part number — production cannot use this file.",
+                fg=WARN)
+            btn_map.pack(side="right")
+        else:
+            btn_map.pack_forget()
+            if is_part and not usable:
+                detail_lbl.config(
+                    text="Mapped file is missing from vision_models — re-teach this part.",
+                    fg=WARN)
+            elif usable and info["threshold"] < 0.55:
+                detail_lbl.config(
+                    text="This part passes at a %.2f match — near enough to accept any "
+                         "frame. Raise it with “Threshold…”." % info["threshold"],
+                    fg=WARN)
+            elif is_part:
+                detail_lbl.config(
+                    text="Run Test captures a live frame and judges it exactly as the "
+                         "test cycle does.", fg=TXT_FAINT)
+            else:
+                detail_lbl.config(text="", fg=TXT_FAINT)
+
+    tree.bind("<<TreeviewSelect>>", _on_select)
+    tree.bind("<Double-1>", lambda e: _run_test())
+    tree.bind("<Delete>", lambda e: _delete())
+
+    # ── Teardown ───────────────────────────────────────────────────────────
+    def _on_destroy(event):
+        if event.widget is content:
+            alive["page"] = False
+
+    content.bind("<Destroy>", _on_destroy)
+
+    _refresh_table()
+    _refresh_camera()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Teach wizard
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MIN_REFS = 3
+MAX_REFS = 12
+
+
+def _dialog(parent, title, width, height):
+    """Modal toplevel, centred on the app window, styled like the page."""
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(bg=BG)
+    win.transient(parent.winfo_toplevel())
+    win.resizable(True, True)
+    root = parent.winfo_toplevel()
+    root.update_idletasks()
+    # Never larger than the screen, or the footer buttons fall off it.
+    width = min(width, win.winfo_screenwidth() - 40)
+    height = min(height, win.winfo_screenheight() - 80)
+    x = root.winfo_rootx() + (root.winfo_width() - width) // 2
+    y = root.winfo_rooty() + (root.winfo_height() - height) // 3
+    win.geometry("%dx%d+%d+%d" % (width, height, max(x, 0), max(y, 0)))
+    win.grab_set()
+    return win
+
+
+def _dialog_header(win, title, subtitle):
+    bar = tk.Frame(win, bg=ui.NAVY)
+    bar.pack(fill="x")
+    inner = tk.Frame(bar, bg=ui.NAVY)
+    inner.pack(fill="x", padx=18, pady=10)
+    tk.Label(inner, text=title, bg=ui.NAVY, fg=ui.TEXT_ON_DARK,
+             font=(FONT, 15, "bold")).pack(anchor="w")
+    tk.Label(inner, text=subtitle, bg=ui.NAVY, fg=ui.ACCENT_SOFT,
+             font=(FONT, 11)).pack(anchor="w")
+    return bar
+
+
+def _dialog_footer(win):
+    """The strip of action buttons along the foot of a dialog. Returns its body.
+
+    Packed from the bottom before the body, so it keeps its height however much
+    the body asks for.
+    """
+    foot = tk.Frame(win, bg=PANEL)
+    foot.pack(side="bottom", fill="x")
+    tk.Frame(win, bg=LINE, height=1).pack(side="bottom", fill="x")
+    foot_in = tk.Frame(foot, bg=PANEL)
+    foot_in.pack(fill="x", padx=18, pady=12)
+    return foot_in
+
+
+def _step(parent, number, title):
+    """Numbered step block in the wizard rail. Returns its body frame."""
+    wrap = tk.Frame(parent, bg=BG)
+    wrap.pack(fill="x", pady=(0, 14))
+    head = tk.Frame(wrap, bg=BG)
+    head.pack(fill="x")
+    badge = tk.Label(head, text=str(number), bg=ui.SUBTLE, fg=TXT,
+                     font=(FONT, 11, "bold"), width=3)
+    badge.pack(side="left")
+    tk.Label(head, text=title, bg=BG, fg=TXT,
+             font=(FONT, 12, "bold")).pack(side="left", padx=(8, 0))
+    body = tk.Frame(wrap, bg=BG)
+    body.pack(fill="x", padx=(34, 0), pady=(6, 0))
+    wrap.badge = badge
+    return body, badge
+
+
+def _open_teach_wizard(parent, cam, part_number=None):
+    """Teach or re-teach one part. Returns the saved part number, or None."""
+    if not _cv2_ok or not _pil_ok:
+        messagebox.showerror("Vision", "OpenCV and Pillow are required to teach a part.",
+                             parent=parent)
+        return None
+
+    from vision_engine.vision_controller import VisionController, DEFAULT_MATCH_THRESHOLD
+    from vision_engine import camera
+
+    ctrl = VisionController()
+    existing_parts = set(ctrl.get_mapped_parts())
+    reteach = part_number is not None
+    # Re-teaching keeps whatever threshold the part was tuned to; only a brand
+    # new part inherits the page default.
+    info = ctrl.model_info(part_number) if reteach else None
+    threshold = (info or {}).get(
+        "threshold", ctrl.config.get("match_threshold", DEFAULT_MATCH_THRESHOLD))
+
+    win = _dialog(parent, "Teach Part", 1120, 720)
+    _dialog_header(
+        win,
+        "Re-teach “%s”" % part_number if reteach else "Teach New Part",
+        "Capture the good part a few times, then box it on every reference.")
+
+    alive = {"v": True}
+    refs = []                       # [{"img", "label", "thumb", "roi"}]
+    sel = {"i": None}
+    live = {"on": False}
+    stream = {"s": None}
+    ref_size = {"wh": None}
+
+    # ── Footer: checklist + actions ────────────────────────────────────────
+    # Packed before the body: the packer serves slaves in packing order, so a
+    # body packed first claims the height it wants and leaves the footer with
+    # the remainder — which collapsed these buttons to a sliver as soon as the
+    # reference strip grew. Claiming the footer's space up front keeps them
+    # whole no matter how many references are loaded.
+    foot_in = _dialog_footer(win)
+
+    checklist = tk.Label(foot_in, text="", bg=PANEL, fg=TXT_DIM, font=(MONO, 11),
+                         anchor="w", justify="left")
+    checklist.pack(side="left")
+
+    btn_save = _btn(foot_in, "Save Dataset", BTN_SUCCESS, font_size=12, pady=8,
+                    icon="check")
+    btn_save.pack(side="right")
+    btn_cancel = _btn(foot_in, "Cancel", BTN_NEUTRAL, font_size=12, pady=8)
+    btn_cancel.pack(side="right", padx=(0, 8))
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    # ── Left: image view + view toolbar ────────────────────────────────────
+    left = tk.Frame(body, bg=BG)
+    left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+    left.rowconfigure(0, weight=1)
+    left.columnconfigure(0, weight=1)
+
+    view_wrap = tk.Frame(left, bg=LINE)
+    view_wrap.grid(row=0, column=0, sticky="nsew")
+    view = RoiView(view_wrap, on_change=lambda r, final: _roi_changed(r, final))
+    view.pack(fill="both", expand=True, padx=1, pady=1)
+
+    view_bar = tk.Frame(left, bg=BG)
+    view_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+    frame_lbl = tk.Label(view_bar, text="", bg=BG, fg=TXT_DIM, font=(MONO, 11))
+    frame_lbl.pack(side="right")
+    btn_live = _btn(view_bar, "Live View", BTN_NEUTRAL, icon="play")
+    btn_capture = _btn(view_bar, "Capture Frame", BTN_SUCCESS, icon="camera")
+    btn_import = _btn(view_bar, "Import Files…", BTN_NEUTRAL, icon="document")
+
+    # ── Right: steps ───────────────────────────────────────────────────────
+    # Scrollable: at a full dozen references the thumbnail and crop strips are
+    # taller than the window, and the crops are the one place an operator can
+    # see that a box missed the part — they have to stay reachable.
+    # 356 = the 34px step indent + a 4-wide thumbnail strip (304px) + the
+    # scrollbar, so the fourth column isn't sliced off.
+    rail_wrap = tk.Frame(body, bg=BG, width=356)
+    rail_wrap.grid(row=0, column=1, sticky="ns")
+    rail_wrap.pack_propagate(False)
+
+    rail_canvas = tk.Canvas(rail_wrap, bg=BG, highlightthickness=0, bd=0)
+    rail_sb = ttk.Scrollbar(rail_wrap, orient="vertical", command=rail_canvas.yview)
+    rail_canvas.configure(yscrollcommand=rail_sb.set)
+    rail_sb.pack(side="right", fill="y")
+    rail_canvas.pack(side="left", fill="both", expand=True)
+
+    rail = tk.Frame(rail_canvas, bg=BG)
+    rail_window = rail_canvas.create_window((0, 0), window=rail, anchor="nw")
+
+    def _rail_resized(_event=None):
+        rail_canvas.configure(scrollregion=rail_canvas.bbox("all"))
+        rail_canvas.itemconfigure(rail_window, width=rail_canvas.winfo_width())
+
+    rail.bind("<Configure>", _rail_resized)
+    rail_canvas.bind("<Configure>", _rail_resized)
+
+    def _rail_wheel(event):
+        try:
+            rail_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        except Exception:
+            pass
+
+    # Bound while the pointer is over the rail rather than globally, so the
+    # wheel keeps working normally everywhere else.
+    rail_canvas.bind("<Enter>", lambda e: rail_canvas.bind_all("<MouseWheel>", _rail_wheel))
+    rail_canvas.bind("<Leave>", lambda e: rail_canvas.unbind_all("<MouseWheel>"))
+
+    s1, b1 = _step(rail, 1, "Part number")
+    master_parts = _fetch_master_parts()
+    ent_pno = _PnoField(s1, master_parts)
+    ent_pno.pack(fill="x", ipady=5)
+    pno_note = tk.Label(s1, text="", bg=BG, fg=TXT_FAINT, font=(FONT, 10),
+                        anchor="w", wraplength=270, justify="left")
+    pno_note.pack(fill="x", pady=(4, 0))
+    if master_parts is None:
+        tk.Label(s1, text="Could not reach the model master — a typed value won't "
+                          "be checked against it.",
+                 bg=BG, fg=WARN, font=(FONT, 10), wraplength=270,
+                 justify="left", anchor="w").pack(fill="x", pady=(2, 0))
+    if reteach:
+        ent_pno.set(part_number)
+        ent_pno.lock()
+        pno_note.config(text="Saving replaces the existing dataset for this part.",
+                        fg=WARN)
+    else:
+        ent_pno.focus_set()
+
+    s2, b2 = _step(rail, 2, "Reference images")
+    tk.Label(s2, text="Capture the same good part %d+ times — vary position and "
+                      "lighting slightly, the way the line will." % MIN_REFS,
+             bg=BG, fg=TXT_FAINT, font=(FONT, 10), wraplength=270,
+             justify="left", anchor="w").pack(fill="x", pady=(0, 8))
+    refs_count = tk.Label(s2, text="", bg=BG, fg=TXT_DIM, font=(FONT, 11, "bold"),
+                          anchor="w")
+    refs_count.pack(fill="x")
+    thumbs = tk.Frame(s2, bg=BG)
+    thumbs.pack(fill="x", pady=(6, 0))
+
+    s3, b3 = _step(rail, 3, "Target box")
+    tk.Label(s3, text="Box the part on every reference. The box carries over to the "
+                      "next image — click to drop it on the part there.",
+             bg=BG, fg=TXT_FAINT, font=(FONT, 10), wraplength=270,
+             justify="left", anchor="w").pack(fill="x", pady=(0, 8))
+    roi_row = tk.Frame(s3, bg=BG)
+    roi_row.pack(fill="x")
+    roi_lbl = tk.Label(roi_row, text="Not drawn", bg=BG, fg=WARN,
+                       font=(MONO, 12, "bold"), anchor="w")
+    roi_lbl.pack(side="left")
+    btn_clear_roi = _btn(roi_row, "Clear", BTN_NEUTRAL, pady=3, font_size=10,
+                         command=lambda: view.clear_roi())
+    btn_clear_roi.pack(side="right")
+
+    lock_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(s3, text="Same size on every reference", variable=lock_var,
+                    command=lambda: _apply_lock()).pack(fill="x", pady=(8, 0))
+    tk.Label(s3, text="Matching is not scale-invariant, so crops of different sizes "
+                      "are not directly comparable. Unlock only if the part changes "
+                      "size between references.",
+             bg=BG, fg=TXT_FAINT, font=(FONT, 10), wraplength=270,
+             justify="left", anchor="w").pack(fill="x", pady=(2, 0))
+
+    tk.Label(s3, text="TEMPLATES", bg=BG, fg=TXT_DIM,
+             font=(FONT, 10, "bold"), anchor="w").pack(fill="x", pady=(10, 2))
+    tk.Label(s3, text="The actual pixels each reference contributes — a crop showing "
+                      "background means that box missed the part.",
+             bg=BG, fg=TXT_FAINT, font=(FONT, 10), wraplength=270,
+             justify="left", anchor="w").pack(fill="x", pady=(0, 6))
+    crops = tk.Frame(s3, bg=BG)
+    crops.pack(fill="x")
+
+    result = {"saved": None}
+
+    # ── Behaviour ──────────────────────────────────────────────────────────
+
+    def _boxed():
+        return [r for r in refs if r["roi"]]
+
+    def _gates():
+        pno = ent_pno.get().strip()
+        return {
+            "Part number": bool(pno),
+            "%d+ references" % MIN_REFS: len(refs) >= MIN_REFS,
+            "Box on every reference": bool(refs) and len(_boxed()) == len(refs),
+        }
+
+    def _refresh_gates(*_a):
+        gates = _gates()
+        checklist.config(text="   ".join(
+            ("✓ " if ok else "○ ") + name for name, ok in gates.items()))
+        _set_btn_enabled(btn_save, all(gates.values()))
+
+        for badge, ok in zip((b1, b2, b3), gates.values()):
+            badge.config(bg=OK_GREEN if ok else ui.SUBTLE,
+                         fg=ui.TEXT_ON_DARK if ok else TXT)
+
+        n = len(refs)
+        refs_count.config(
+            text="%d captured%s" % (n, "" if n >= MIN_REFS
+                                    else "  ·  %d more needed" % (MIN_REFS - n)),
+            fg=OK_GREEN if n >= MIN_REFS else WARN)
+
+        if not reteach:
+            pno = ent_pno.get().strip()
+            if pno and pno in existing_parts:
+                pno_note.config(text="“%s” is already taught — saving replaces it."
+                                     % pno, fg=WARN)
+            else:
+                pno_note.config(text="", fg=TXT_FAINT)
+
+    def _apply_lock():
+        """Pin the box size to the first box drawn, unless the operator opts out."""
+        first = next((r["roi"] for r in refs if r["roi"]), None)
+        if lock_var.get() and first:
+            view.lock_size((first["width"], first["height"]))
+        else:
+            view.lock_size(None)
+
+    def _roi_changed(roi, final=True):
+        i = sel["i"]
+        if i is not None and 0 <= i < len(refs):
+            refs[i]["roi"] = roi
+        if roi:
+            roi_lbl.config(text="%d × %d px" % (roi["width"], roi["height"]),
+                           fg=OK_GREEN)
+        else:
+            roi_lbl.config(text="Not drawn", fg=WARN)
+        _set_btn_enabled(btn_clear_roi, roi is not None)
+        if not final:
+            return          # mid-drag: the readout is live, the strips are not
+        _apply_lock()
+        _paint_thumbs()
+        _paint_crops()
+        _refresh_gates()
+
+    def _set_live(on):
+        live["on"] = on and stream["s"] is not None
+        if live["on"]:
+            sel["i"] = None
+            view.set_roi(None, notify=False)
+            view.set_editable(False)
+            view.set_hint("Live view — capture a frame to draw the target box")
+            frame_lbl.config(text="LIVE  ·  camera %d" % cam["index"])
+        else:
+            view.set_editable(True)
+            view.set_hint("Drag to box the part")
+        _paint_buttons()
+
+    def _show_ref(i):
+        if not (0 <= i < len(refs)):
+            return
+        live["on"] = False
+        sel["i"] = i
+        # Seed from the nearest reference that already has a box, in either
+        # direction, so the operator nudges an existing box onto the part instead
+        # of redrawing it — whatever order they work through the images in.
+        if refs[i]["roi"] is None:
+            near = min((j for j in range(len(refs)) if refs[j]["roi"]),
+                       key=lambda j: abs(j - i), default=None)
+            if near is not None:
+                refs[i]["roi"] = dict(refs[near]["roi"])
+        view.set_image(refs[i]["img"])
+        _apply_lock()
+        view.set_roi(refs[i]["roi"], notify=False)
+        view.set_editable(True)
+        view.set_hint("Click to place the box on the part"
+                      if view._locked_size else "Drag to box the part")
+        frame_lbl.config(text="REFERENCE %d of %d  ·  %s"
+                              % (i + 1, len(refs), refs[i]["label"]))
+        _roi_changed(refs[i]["roi"])
+        _paint_thumbs()
+        _paint_buttons()
+
+    def _paint_buttons():
+        has_cam = stream["s"] is not None
+        btn_live.pack_forget(); btn_capture.pack_forget(); btn_import.pack_forget()
+        if has_cam:
+            btn_capture.pack(side="left")
+            btn_live.pack(side="left", padx=(8, 0))
+            _set_btn_enabled(btn_live, not live["on"])
+            btn_import.pack(side="left", padx=(8, 0))
+        else:
+            btn_import.pack(side="left")
+
+    def _paint_thumbs():
+        for w in thumbs.winfo_children():
+            w.destroy()
+        for i, ref in enumerate(refs):
+            r, c = divmod(i, 4)
+            selected = (i == sel["i"])
+            # An unboxed reference is the one thing that blocks saving, so it is
+            # marked on the strip rather than only in the checklist.
+            edge = OK_GREEN if selected else (LINE if ref["roi"] else ui.WARNING)
+            cell = tk.Frame(thumbs, bg=edge, cursor="hand2")
+            cell.grid(row=r, column=c, padx=(0, 6), pady=(0, 6))
+            holder = tk.Frame(cell, bg=VIEW_BG)
+            holder.pack(padx=2, pady=2)
+            lbl = tk.Label(holder, image=ref["thumb"], bd=0, bg=VIEW_BG, cursor="hand2")
+            lbl.pack()
+            for w in (cell, holder, lbl):
+                w.bind("<Button-1>", lambda e, i=i: _show_ref(i))
+            x = tk.Label(cell, text="✕", bg=edge, fg=ui.readable_on(edge),
+                         font=(FONT, 9, "bold"), cursor="hand2")
+            x.place(relx=1.0, rely=0.0, anchor="ne")
+            x.bind("<Button-1>", lambda e, i=i: _remove_ref(i))
+
+    def _crop(ref):
+        r = ref["roi"]
+        if not r:
+            return None
+        return ref["img"][r["y"]:r["y"] + r["height"], r["x"]:r["x"] + r["width"]]
+
+    def _paint_crops():
+        for w in crops.winfo_children():
+            w.destroy()
+        drawn = 0
+        for i, ref in enumerate(refs):
+            patch = _crop(ref)
+            if patch is None or patch.size == 0:
+                continue
+            r, c = divmod(drawn, 4)
+            drawn += 1
+            cell = tk.Frame(crops, bg=OK_GREEN if i == sel["i"] else LINE,
+                            cursor="hand2")
+            cell.grid(row=r, column=c, padx=(0, 6), pady=(0, 6))
+            holder = tk.Frame(cell, bg=VIEW_BG, width=66, height=50)
+            holder.pack_propagate(False)
+            holder.pack(padx=2, pady=2)
+            photo, _ = _to_photo(patch, 62, 46)
+            ref["crop_photo"] = photo          # keep a reference alive
+            lbl = tk.Label(holder, image=photo, bd=0, bg=VIEW_BG, cursor="hand2")
+            lbl.pack(expand=True)
+            for w in (cell, holder, lbl):
+                w.bind("<Button-1>", lambda e, i=i: _show_ref(i))
+
+    def _add_ref(img, label):
+        if len(refs) >= MAX_REFS:
+            messagebox.showinfo("References",
+                                "%d reference images is the maximum." % MAX_REFS,
+                                parent=win)
+            return False
+        h, w = img.shape[:2]
+        if ref_size["wh"] is None:
+            ref_size["wh"] = (w, h)
+        elif (w, h) != ref_size["wh"]:
+            return False
+        thumb, _ = _to_photo(img, 66, 50)
+        refs.append({"img": img, "label": label, "thumb": thumb, "roi": None})
+        return True
+
+    def _remove_ref(i):
+        if not (0 <= i < len(refs)):
+            return
+        refs.pop(i)
+        if not refs:
+            ref_size["wh"] = None
+            view.lock_size(None)
+            view.set_image(None)
+            view.set_placeholder("No reference images yet")
+            sel["i"] = None
+            _set_live(stream["s"] is not None)
+            _roi_changed(None)
+        else:
+            _show_ref(min(i, len(refs) - 1))
+        _paint_thumbs()
+        _paint_crops()
+        _refresh_gates()
+
+    def _capture():
+        s = stream["s"]
+        if s is None:
+            return
+        frame = s.latest() if live["on"] else s.read(timeout=3.0)
+        if frame is None:
+            messagebox.showwarning("Capture", "No frame from the camera yet.",
+                                   parent=win)
+            return
+        if not _add_ref(frame.copy(), "live"):
+            messagebox.showwarning(
+                "Capture",
+                "The camera changed resolution mid-session.\n\n"
+                "Remove the existing references and start again.", parent=win)
+            return
+        _show_ref(len(refs) - 1)
+        _refresh_gates()
+
+    def _import():
+        paths = filedialog.askopenfilenames(
+            parent=win, title="Select Reference Images",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        if not paths:
+            return
+        skipped = []
+        for p in paths:
+            img = _read_image(p)
+            if img is None:
+                skipped.append((os.path.basename(p), "unreadable"))
+                continue
+            if not _add_ref(img, os.path.basename(p)):
+                skipped.append((os.path.basename(p),
+                                "%d×%d" % (img.shape[1], img.shape[0])))
+        if refs:
+            # Land on the first reference still needing a box, so the operator
+            # works forward through them rather than starting at the end.
+            _show_ref(next((i for i, r in enumerate(refs) if not r["roi"]), 0))
+        _refresh_gates()
+        if skipped:
+            need = "%d×%d" % ref_size["wh"] if ref_size["wh"] else "the camera resolution"
+            messagebox.showwarning(
+                "Some files skipped",
+                "Every reference must be %s so one template fits every frame:\n\n%s"
+                % (need, "\n".join("  •  %s  (%s)" % s for s in skipped)),
+                parent=win)
+
+    btn_capture.configure(command=_capture)
+    btn_import.configure(command=_import)
+    btn_live.configure(command=lambda: _set_live(True))
+
+    def _odd_crops():
+        """Indices of crops that don't look like the others.
+
+        A box left behind on background still produces a valid template, and
+        max-of-N scoring means one background template is enough to pass an empty
+        fixture. Correlating every crop against the first one catches that before
+        it reaches the line.
+        """
+        patches = [_crop(r) for r in refs]
+        if any(p is None or p.size == 0 for p in patches):
+            return []
+        grays = [cv2.cvtColor(p, cv2.COLOR_BGR2GRAY) if len(p.shape) == 3 else p
+                 for p in patches]
+        h, w = grays[0].shape[:2]
+        odd = []
+        for i, g in enumerate(grays[1:], start=1):
+            probe = cv2.resize(g, (w, h)) if g.shape[:2] != (h, w) else g
+            score = cv2.matchTemplate(grays[0], probe, cv2.TM_CCOEFF_NORMED)[0][0]
+            if score < 0.35:
+                odd.append((i, score))
+        return odd
+
+    def _save():
+        pno = ent_pno.get().strip()
+        rois = [r["roi"] for r in refs]
+        if not (pno and len(refs) >= MIN_REFS and all(rois)):
+            return
+        if any(r["width"] < RoiView.MIN_ROI or r["height"] < RoiView.MIN_ROI
+               for r in rois):
+            messagebox.showerror("Target Box",
+                                 "One of the boxes is too small to match reliably.",
+                                 parent=win)
             return
 
-        # The live picture when there is one; otherwise the engine captures
-        # from the configured camera itself, exactly as on the line.
-        frame = self.stream.latest() if self.stream is not None else None
-        # Settings saved earlier on this page must be the ones judged with.
-        self.controller.reload_config()
+        odd = _odd_crops()
+        if odd:
+            listing = "\n".join("  •  Reference %d  (similarity %.2f)" % (i + 1, s)
+                                for i, s in odd)
+            if not messagebox.askyesno(
+                    "Check the Boxes",
+                    "These crops do not resemble the first one:\n\n%s\n\n"
+                    "That usually means the box missed the part on those images. "
+                    "A template of plain background will match the empty fixture "
+                    "and pass it.\n\nSave anyway?" % listing, parent=win):
+                return
 
-        self.test_result = None
-        self.show_message(f"Testing {part}...", 'info')
-
-        def work():
-            self.test_result = self.controller.inspect(part, frame=frame)
-
-        self.test_thread = threading.Thread(target=work, daemon=True)
-        self.test_thread.start()
-        self.poll_job = self.root.after(POLL_MS, self.poll_test)
-
-    def poll_test(self):
-        self.poll_job = None
-        if self.test_thread is None:
+        if not reteach and pno in existing_parts and not messagebox.askyesno(
+                "Replace Dataset",
+                "“%s” already has a vision dataset.\n\nReplace it?" % pno, parent=win):
             return
-        if self.test_thread.is_alive():
-            self.poll_job = self.root.after(POLL_MS, self.poll_test)
+        cw, ch = cam["width"], cam["height"]
+        rw, rh = ref_size["wh"]
+        if cam["enabled"] and cam["index"] >= 0 and (rw, rh) != (cw, ch):
+            if not messagebox.askyesno(
+                    "Resolution Mismatch",
+                    "References are %d×%d but the camera is configured for %d×%d.\n\n"
+                    "Inspection will fail if the template does not fit a live frame.\n\n"
+                    "Save anyway?" % (rw, rh, cw, ch), parent=win):
+                return
+        try:
+            ctrl.build_and_save_model(
+                part_number=pno, images=[r["img"] for r in refs],
+                roi=rois, match_threshold=float(threshold))
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e), parent=win)
+            return
+        result["saved"] = pno
+        _close()
+
+    btn_save.configure(command=_save)
+
+    def _close():
+        alive["v"] = False
+        if stream["s"] is not None:
+            try:
+                stream["s"].release()
+            except Exception:
+                pass
+            stream["s"] = None
+        try:
+            # Closing with the pointer over the rail would otherwise leave the
+            # wheel bound to a destroyed canvas.
+            rail_canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+
+    btn_cancel.configure(command=_close)
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.bind("<Escape>", lambda e: _close())
+    ent_pno.bind("<KeyRelease>", _refresh_gates)
+
+    # ── Camera bring-up ────────────────────────────────────────────────────
+    if cam["enabled"] and cam["index"] >= 0:
+        stream["s"] = camera.acquire(cam["index"], cam["width"], cam["height"])
+        view.set_placeholder("Starting camera %d…" % cam["index"])
+        _set_live(True)
+    else:
+        view.set_placeholder("No camera configured\n\n"
+                             "Import reference images, or set a camera up first.")
+        _set_live(False)
+
+    def _tick():
+        if not alive["v"]:
+            return
+        s = stream["s"]
+        if live["on"] and s is not None:
+            frame = s.latest()
+            if frame is not None:
+                view.set_image(frame)
+            elif not s.is_alive():
+                live["on"] = False
+                view.set_image(None)
+                view.set_placeholder("Camera %d stopped responding" % cam["index"])
+                frame_lbl.config(text="CAMERA UNAVAILABLE")
+        try:
+            win.after(60, _tick)
+        except Exception:
+            pass
+
+    _paint_buttons()
+    _roi_changed(None)
+    _paint_crops()
+    _refresh_gates()
+    _tick()
+
+    parent.wait_window(win)
+    return result["saved"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inspection test
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VERDICT_INK = {"OK": OK_GREEN, "NG": NG_RED, "ERROR": WARN}
+_VERDICT_FILL = {"OK": ui.SUCCESS_SOFT, "NG": ui.DANGER_SOFT, "ERROR": ui.ROW_BAND}
+
+
+def _draw_score_meter(canvas, score, threshold, verdict_color):
+    """Horizontal 0–1 correlation bar with the threshold marked on it."""
+    canvas.delete("all")
+    w = max(canvas.winfo_width(), 1)
+    h = canvas.winfo_height()
+    top, bot = 8, h - 16
+
+    canvas.create_rectangle(0, top, w, bot, fill=ui.SUBTLE, outline=LINE)
+    if score is not None and score > 0:
+        canvas.create_rectangle(0, top, w * min(max(score, 0.0), 1.0), bot,
+                                fill=verdict_color, outline="")
+    tx = w * min(max(threshold, 0.0), 1.0)
+    canvas.create_line(tx, top - 4, tx, bot + 4, fill=TXT, width=2)
+    canvas.create_text(tx, h - 5, text="threshold %.2f" % threshold,
+                       fill=TXT_DIM, font=(MONO, 9),
+                       anchor="e" if tx > w * 0.6 else "w")
+    canvas.create_text(2, h - 5, text="0.0", fill=TXT_FAINT,
+                       font=(MONO, 9), anchor="w")
+
+
+def _open_test_dialog(parent, ctrl, part_number, on_changed=None):
+    """Run the production inspect() path against the live camera, or a still image."""
+    win = _dialog(parent, "Inspection Test", 900, 660)
+    _dialog_header(win, "Inspection Test — %s" % part_number,
+                   "Runs the same match path the test cycle uses — against the "
+                   "live camera, or a still image you supply.")
+
+    foot_in = _dialog_footer(win)
+
+    verdict = tk.Frame(win, bg=ui.SUBTLE, height=54)
+    verdict.pack(fill="x")
+    verdict.pack_propagate(False)
+    verdict_lbl = tk.Label(verdict, text="RUNNING…", bg=ui.SUBTLE, fg=TXT_DIM,
+                           font=(FONT, 22, "bold"))
+    verdict_lbl.pack(side="left", padx=18)
+    verdict_note = tk.Label(verdict, text="", bg=ui.SUBTLE, fg=TXT_DIM,
+                            font=(FONT, 11), anchor="e", justify="right")
+    verdict_note.pack(side="right", padx=18)
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    view_wrap = tk.Frame(body, bg=LINE)
+    view_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+    view = RoiView(view_wrap, editable=False)
+    view.pack(fill="both", expand=True, padx=1, pady=1)
+    view.set_placeholder("Capturing…")
+
+    rail = tk.Frame(body, bg=BG, width=260)
+    rail.grid(row=0, column=1, sticky="ns")
+    rail.pack_propagate(False)
+
+    metrics = _card(rail, "Result", icon="chart")
+    metrics.pack(fill="x")
+    mb = metrics.body
+    m_source = _kv_row(mb, "Source", "Live camera", mono=False)
+    m_score = _kv_row(mb, "Score", "—", mono=True)
+    m_thresh = _kv_row(mb, "Threshold", "—", mono=True)
+    m_time = _kv_row(mb, "Time", "—", mono=True)
+    m_refs = _kv_row(mb, "References", "—", mono=True)
+    m_tmpl = _kv_row(mb, "Template", "—", mono=True)
+
+    meter = tk.Canvas(mb, bg=PANEL, height=34, highlightthickness=0, bd=0)
+    meter.pack(fill="x", pady=(10, 0))
+
+    hint = tk.Label(rail, text="", bg=BG, fg=TXT_DIM, font=(FONT, 10),
+                    wraplength=240, justify="left", anchor="w")
+    hint.pack(fill="x", pady=(12, 0))
+
+    btn_close = _btn(foot_in, "Close", BTN_NEUTRAL, font_size=12, pady=8)
+    btn_close.pack(side="right")
+    btn_rerun = _btn(foot_in, "Run Again", BTN_PRIMARY, font_size=12, pady=8,
+                     icon="refresh")
+    btn_rerun.pack(side="right", padx=(0, 8))
+    btn_source = _btn(foot_in, "Test Image…", BTN_NEUTRAL, font_size=12, pady=8,
+                      icon="document")
+    btn_source.pack(side="right", padx=(0, 8))
+    btn_tune = _btn(foot_in, "Adjust Threshold…", BTN_NEUTRAL, font_size=12, pady=8,
+                    icon="ruler")
+    btn_tune.pack(side="left")
+
+    alive = {"v": True}
+    last = {"result": None}
+    source = {"kind": "camera", "image": None, "label": None}
+    busy = {"v": False}
+    # A run asked for while one is still judging: done straight after it,
+    # so switching the source mid-run is not silently dropped.
+    pending = {"v": False}
+    meter_thr = {"v": 0.0}
+
+    def _paint_verdict(fill):
+        verdict.config(bg=fill)
+        for w_ in (verdict_lbl, verdict_note):
+            w_.config(bg=fill)
+
+    def _run():
+        """Judge in the background: a cold camera takes a second or more to settle,
+        and the dialog must keep painting while it does."""
+        if not alive["v"]:
+            return
+        if busy["v"]:
+            pending["v"] = True
+            return
+        busy["v"] = True
+        verdict_lbl.config(text="RUNNING…", fg=TXT_DIM)
+        verdict_note.config(text="")
+        _paint_verdict(ui.SUBTLE)
+        _set_btn_enabled(btn_rerun, False)
+
+        ctrl.reload_config()
+        frame = source["image"] if source["kind"] == "image" else None
+        out = {}
+
+        def _work():
+            try:
+                out["result"] = ctrl.inspect(part_number, frame=frame)
+            except Exception as e:
+                out["error"] = e
+
+        worker = threading.Thread(target=_work, daemon=True)
+        worker.start()
+
+        def _wait():
+            if not alive["v"]:
+                return
+            if worker.is_alive():
+                win.after(80, _wait)
+                return
+            busy["v"] = False
+            if pending["v"]:
+                pending["v"] = False
+                _run()
+                return
+            if "error" in out:
+                _set_btn_enabled(btn_rerun, True)
+                verdict_lbl.config(text="ERROR", fg=WARN)
+                verdict_note.config(text=str(out["error"]), fg=WARN)
+                _paint_verdict(ui.ROW_BAND)
+                return
+            _show(out["result"])
+
+        _wait()
+
+    def _show(result):
+        last["result"] = result
+        color = _VERDICT_INK.get(result.judgement, TXT_DIM)
+        _paint_verdict(_VERDICT_FILL.get(result.judgement, ui.SUBTLE))
+        verdict_lbl.config(text=result.judgement, fg=color)
+        verdict_note.config(text=result.error or "Part found", fg=color)
+
+        info = ctrl.model_info(part_number) or {}
+        m_source.config(text="Live camera" if source["kind"] == "camera" else source["label"])
+        m_score.config(text="%.4f" % result.match_score if result.match_score > 0 else "—",
+                       fg=color)
+        m_thresh.config(text="%.2f" % result.threshold if result.threshold else
+                        "%.2f" % info.get("threshold", 0.0), fg=TXT)
+        m_time.config(text="%d ms" % result.processing_time_ms, fg=TXT)
+        m_refs.config(text=str(info.get("references", "—")), fg=TXT)
+        tw, th = info.get("template_size", (0, 0))
+        m_tmpl.config(text="%d x %d" % (tw, th) if tw else "—", fg=TXT)
+
+        if result.frame is not None:
+            view.set_image(result.frame)
+            view.set_accent(color)
+            if result.match_box:
+                x, y, bw, bh = result.match_box
+                view.set_roi({"x": x, "y": y, "width": bw, "height": bh}, notify=False)
+            view.set_hint("Best match found in this " +
+                          ("image" if source["kind"] == "image" else "frame"))
+        else:
+            view.set_image(None)
+            view.set_placeholder(result.error or "No frame captured")
+
+        thr = result.threshold or info.get("threshold", 0.0)
+        meter_thr["v"] = thr
+        _draw_score_meter(meter, result.match_score, thr, color)
+
+        if result.judgement == "NG":
+            hint.config(
+                text="The best match scored %.2f against a %.2f threshold. If the part "
+                     "is genuinely present and correct, either re-teach it with more "
+                     "reference images or lower this part's threshold."
+                     % (result.match_score, thr), fg=WARN)
+        elif result.judgement == "ERROR":
+            hint.config(text="Nothing was judged — fix the error above and run again.",
+                        fg=WARN)
+        else:
+            hint.config(text="Headroom above threshold: %+.2f."
+                             % (result.match_score - thr), fg=TXT_DIM)
+        _set_btn_enabled(btn_rerun, True)
+        _set_btn_enabled(btn_tune, bool(info))
+
+    def _pick_image():
+        if source["kind"] == "image":
+            # Already testing an image — the button toggles back to the camera.
+            source["kind"], source["image"], source["label"] = "camera", None, None
+            btn_source.configure(text="Test Image…")
+            _run()
             return
 
-        self.test_thread = None
-        result = self.test_result
-        if result is None:
+        path = filedialog.askopenfilename(
+            parent=win, title="Select Test Image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        if not path:
             return
-
-        if result.judgement == 'ERROR':
-            self.show_message(f"{result.part_number}: {result.error}", 'danger')
+        img = _read_image(path)
+        if img is None:
+            messagebox.showerror("Test Image", "Could not read that image file.", parent=win)
             return
+        source["kind"] = "image"
+        source["image"] = img
+        source["label"] = os.path.basename(path)
+        btn_source.configure(text="Use Live Camera")
+        _run()
 
-        self.clear_reference_selection()
-        self.mode = 'result'
-        self.show_result(result)
-        self.show_message(
-            "{}  {}  -  score {:.2f}, needs {:.2f}  ({} ms)".format(
-                result.part_number, result.judgement, result.match_score,
-                result.threshold, result.processing_time_ms),
-            'success' if result.ok else 'danger')
-        if self.stream is not None:
-            self.live_button.configure(text="Back to Live View")
+    def _tune():
+        info = ctrl.model_info(part_number)
+        if info and _open_threshold_dialog(parent, ctrl, part_number,
+                                           info["threshold"], anchor=win):
+            if on_changed:
+                on_changed()
+            _run()
 
-    def show_result(self, result):
-        if result.frame is None:
+    def _close():
+        alive["v"] = False
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+
+    btn_rerun.configure(command=_run)
+    btn_source.configure(command=_pick_image)
+    btn_tune.configure(command=_tune)
+    btn_close.configure(command=_close)
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.bind("<Escape>", lambda e: _close())
+    meter.bind("<Configure>", lambda e: last["result"] and _draw_score_meter(
+        meter, last["result"].match_score,
+        meter_thr["v"],
+        _VERDICT_INK.get(last["result"].judgement, WARN)))
+
+    win.after(120, _run)
+    parent.wait_window(win)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Small dialogs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _open_threshold_dialog(parent, ctrl, part_number, current, anchor=None):
+    """Edit one taught part's own threshold. Returns True if it was saved."""
+    host = anchor or parent
+    win = _dialog(host, "Match Threshold", 460, 330)
+    _dialog_header(win, "Threshold — %s" % part_number,
+                   "Only this part is affected.")
+
+    saved = {"v": False}
+    var = tk.DoubleVar(value=float(current))
+
+    def _save():
+        try:
+            ctrl.set_model_threshold(part_number, round(var.get(), 2))
+        except Exception as e:
+            messagebox.showerror("Threshold", str(e), parent=win)
             return
-        boxes = ()
-        if result.match_box:
-            boxes = ((result.match_box, BOX_OK if result.ok else BOX_NG),)
-        self.draw(result.frame, boxes)
+        saved["v"] = True
+        win.destroy()
 
-    # ------------------------------------------------------------------
-    # Closing
-    # ------------------------------------------------------------------
+    foot_in = _dialog_footer(win)
+    _btn(foot_in, "Save", BTN_PRIMARY, command=_save, font_size=11,
+         pady=8, icon="check").pack(side="right")
+    _btn(foot_in, "Cancel", BTN_NEUTRAL, command=win.destroy, font_size=11,
+         pady=8).pack(side="right", padx=(0, 8))
 
-    def cleanup(self):
-        for job in (self.poll_job, self.preview_job):
-            if job is not None:
-                try:
-                    self.root.after_cancel(job)
-                except tk.TclError:
-                    pass
-        self.poll_job = None
-        self.preview_job = None
-        if self.stream is not None:
-            self.stream.release()
-            self.stream = None
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=20, pady=16)
 
-    def on_close(self):
-        self.cleanup()
-        self.root.destroy()
+    row = tk.Frame(body, bg=BG)
+    row.pack(fill="x")
+    tk.Label(row, text="Match threshold", bg=BG, fg=TXT,
+             font=(FONT, 12, "bold")).pack(side="left")
+    val = tk.Label(row, text="%.2f" % current, bg=BG, fg=ACCENT,
+                   font=(MONO, 17, "bold"))
+    val.pack(side="right")
+
+    ttk.Scale(body, from_=0.40, to=0.99, orient="horizontal",
+              variable=var).pack(fill="x", pady=(8, 4))
+
+    caption = tk.Label(body, text="", bg=BG, fg=TXT_DIM, font=(FONT, 11),
+                       wraplength=400, justify="left", anchor="w")
+    caption.pack(fill="x", pady=(6, 0))
+    tk.Label(body, text="Lower it if good parts are being rejected; raise it if a "
+                        "wrong or missing part still passes.",
+             bg=BG, fg=TXT_FAINT, font=(FONT, 10), wraplength=400,
+             justify="left", anchor="w").pack(fill="x", pady=(10, 0))
+
+    def _upd(*_a):
+        v = round(var.get(), 2)
+        val.config(text="%.2f" % v)
+        text, color = _threshold_caption(v)
+        caption.config(text=text, fg=color)
+
+    var.trace_add("write", _upd)
+    _upd()
+
+    win.bind("<Escape>", lambda e: win.destroy())
+
+    host.wait_window(win)
+    return saved["v"]
+
+
+def _prompt_part_number(parent, title, prompt, taken=()):
+    """Ask for a part number, backed by the part master when it's reachable.
+
+    Returns the chosen value, or None.
+    """
+    win = _dialog(parent, title, 460, 270)
+    _dialog_header(win, title, prompt)
+
+    out = {"v": None}
+    foot_in = _dialog_footer(win)
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=20, pady=18)
+    master_parts = _fetch_master_parts()
+    field = _PnoField(body, master_parts, font_size=14)
+    field.pack(fill="x", ipady=6)
+    field.focus_set()
+    note = tk.Label(body, text="", bg=BG, fg=WARN, font=(FONT, 10), anchor="w",
+                    wraplength=400, justify="left")
+    note.pack(fill="x", pady=(6, 0))
+    if master_parts is None:
+        note.config(text="Could not reach the model master — a typed value won't "
+                         "be checked against it.")
+
+    def _check(*_a):
+        v = field.get()
+        if v and v in taken:
+            note.config(text="“%s” is already mapped — saving will re-point it." % v)
+        elif master_parts is None:
+            note.config(text="Could not reach the model master — a typed value "
+                             "won't be checked against it.")
+        else:
+            note.config(text="")
+
+    def _ok(event=None):
+        v = field.get()
+        if not v:
+            note.config(text="Enter a part number.")
+            return
+        out["v"] = v
+        win.destroy()
+
+    field.bind("<KeyRelease>", _check)
+    field.bind("<Return>", _ok)
+    win.bind("<Escape>", lambda e: win.destroy())
+
+    _btn(foot_in, "OK", BTN_PRIMARY, command=_ok, font_size=11, pady=8).pack(side="right")
+    _btn(foot_in, "Cancel", BTN_NEUTRAL, command=win.destroy, font_size=11,
+         pady=8).pack(side="right", padx=(0, 8))
+
+    parent.wait_window(win)
+    return out["v"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Camera configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _open_camera_dialog(parent):
+    """Pick and verify the inspection camera. Returns True if the config changed."""
+    if not _cv2_ok or not _pil_ok:
+        messagebox.showerror("Camera", "OpenCV and Pillow are required.", parent=parent)
+        return False
+
+    from vision_engine import camera
+
+    cam = _load_cam_cfg()
+    win = _dialog(parent, "Camera Configuration", 820, 580)
+    _dialog_header(win, "Inspection Camera",
+                   "The preview is the exact feed inspection will use.")
+
+    alive = {"v": True}
+    stream = {"s": None, "index": None}
+    found = {"cams": []}
+    changed = {"v": False}
+
+    foot_in = _dialog_footer(win)
+    btn_save = _btn(foot_in, "Save", BTN_PRIMARY, font_size=12, pady=8, icon="check")
+    btn_save.pack(side="right")
+    btn_cancel = _btn(foot_in, "Cancel", BTN_NEUTRAL, font_size=12, pady=8)
+    btn_cancel.pack(side="right", padx=(0, 8))
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    prev_wrap = tk.Frame(body, bg=LINE)
+    prev_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+    preview = RoiView(prev_wrap, editable=False)
+    preview.pack(fill="both", expand=True, padx=1, pady=1)
+    preview.set_placeholder("Scanning for cameras…")
+
+    rail = tk.Frame(body, bg=BG, width=270)
+    rail.grid(row=0, column=1, sticky="ns")
+    rail.pack_propagate(False)
+
+    card = _card(rail, "Device", icon="camera")
+    card.pack(fill="x")
+    cb_body = card.body
+
+    tk.Label(cb_body, text="Camera", bg=PANEL, fg=TXT_DIM, font=(FONT, 11),
+             anchor="w").pack(fill="x")
+    dev_var = tk.StringVar()
+    cmb_dev = ttk.Combobox(cb_body, textvariable=dev_var, state="readonly",
+                           values=["Scanning…"], font=(FONT, 11))
+    cmb_dev.pack(fill="x", pady=(3, 10))
+
+    tk.Label(cb_body, text="Resolution", bg=PANEL, fg=TXT_DIM, font=(FONT, 11),
+             anchor="w").pack(fill="x")
+    res_var = tk.StringVar()
+    cmb_res = ttk.Combobox(cb_body, textvariable=res_var, state="readonly",
+                           values=["%dx%d" % r for r in RESOLUTIONS],
+                           font=(FONT, 11))
+    cmb_res.pack(fill="x", pady=(3, 10))
+    res_var.set("%dx%d" % (cam["width"], cam["height"]))
+
+    tk.Label(cb_body, text="Reference images are captured at this resolution and "
+                           "must keep matching it, so changing it later means "
+                           "re-teaching every part.",
+             bg=PANEL, fg=TXT_FAINT, font=(FONT, 10), wraplength=215,
+             justify="left", anchor="w").pack(fill="x")
+
+    btn_rescan = _btn(cb_body, "Re-scan", BTN_NEUTRAL, pady=5, icon="refresh")
+    btn_rescan.pack(fill="x", pady=(10, 0))
+
+    status = tk.Label(rail, text="", bg=BG, fg=TXT_DIM, font=(FONT, 11),
+                      wraplength=250, justify="left", anchor="w")
+    status.pack(fill="x", pady=(12, 0))
+
+    DISABLED = "Disabled (no vision capture)"
+
+    def _stop_stream():
+        if stream["s"] is not None:
+            try:
+                stream["s"].release()
+            except Exception:
+                pass
+            stream["s"] = None
+            stream["index"] = None
+
+    def _selected_index():
+        label = dev_var.get()
+        for c in found["cams"]:
+            if label == "Camera %d  (%dx%d)" % (c["index"], c["width"], c["height"]):
+                return c["index"]
+        return -1
+
+    def _on_device_change(*_a):
+        idx = _selected_index()
+        _stop_stream()
+        preview.set_image(None)
+        if idx < 0:
+            preview.set_placeholder("Camera disabled — vision will not run.")
+            status.config(text="Vision inspection needs a camera.", fg=WARN)
+            return
+        w, h = [int(v) for v in res_var.get().split("x")]
+        preview.set_placeholder("Opening camera %d…" % idx)
+        status.config(text="", fg=TXT_DIM)
+        stream["s"] = camera.acquire(idx, w, h)
+        stream["index"] = idx
+
+    cmb_dev.bind("<<ComboboxSelected>>", _on_device_change)
+    cmb_res.bind("<<ComboboxSelected>>", _on_device_change)
+
+    def _scan():
+        _stop_stream()
+        preview.set_image(None)
+        preview.set_placeholder("Scanning for cameras…")
+        cmb_dev.config(values=["Scanning…"], state="disabled")
+        dev_var.set("Scanning…")
+        _set_btn_enabled(btn_rescan, False)
+
+        def _work():
+            cams = _probe_cameras()
+
+            def _apply():
+                if not alive["v"]:
+                    return
+                found["cams"] = cams
+                labels = [DISABLED] + ["Camera %d  (%dx%d)"
+                                       % (c["index"], c["width"], c["height"])
+                                       for c in cams]
+                cmb_dev.config(values=labels, state="readonly")
+                pick = DISABLED
+                for lab, c in zip(labels[1:], cams):
+                    if c["index"] == cam["index"] and cam["enabled"]:
+                        pick = lab
+                dev_var.set(pick)
+                _set_btn_enabled(btn_rescan, True)
+                if not cams:
+                    preview.set_placeholder("No camera detected.\n\n"
+                                            "Check the USB connection and re-scan.")
+                    status.config(text="Nothing responded on indexes 0–5.", fg=NG_RED)
+                else:
+                    status.config(text="%d camera(s) detected." % len(cams), fg=TXT_DIM)
+                _on_device_change()
+
+            try:
+                win.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    btn_rescan.configure(command=_scan)
+
+    def _tick():
+        if not alive["v"]:
+            return
+        s = stream["s"]
+        if s is not None:
+            frame = s.latest()
+            if frame is not None:
+                preview.set_image(frame)
+                preview.set_hint("%d x %d" % (frame.shape[1], frame.shape[0]))
+            elif not s.is_alive():
+                preview.set_image(None)
+                preview.set_placeholder("Camera %d is not delivering frames."
+                                        % stream["index"])
+                status.config(text="The device opened but produced no video. It may be "
+                                   "in use by another program.", fg=NG_RED)
+                _stop_stream()
+        try:
+            win.after(60, _tick)
+        except Exception:
+            pass
+
+    def _save():
+        idx = _selected_index()
+        w, h = [int(v) for v in res_var.get().split("x")]
+        if idx >= 0 and stream["s"] is not None and stream["s"].latest() is None:
+            if not messagebox.askyesno(
+                    "No Preview",
+                    "No frames have arrived from camera %d yet.\n\nSave anyway?" % idx,
+                    parent=win):
+                return
+        try:
+            _save_cam_cfg(idx, w, h, idx >= 0)
+        except OSError as e:
+            messagebox.showerror("Camera", "Could not save the camera:\n\n%s" % e,
+                                 parent=win)
+            return
+        changed["v"] = True
+        _close()
+
+    def _close():
+        alive["v"] = False
+        _stop_stream()
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+
+    btn_save.configure(command=_save)
+    btn_cancel.configure(command=_close)
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.bind("<Escape>", lambda e: _close())
+
+    _scan()
+    _tick()
+    parent.wait_window(win)
+    return changed["v"]
 
 
 def main():
     root = tk.Tk()
-    root.state('zoomed')
+    root.state("zoomed")
     VisionSettings(root)
     root.mainloop()
 
