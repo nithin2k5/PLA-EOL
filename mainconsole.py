@@ -12,6 +12,7 @@ from test_console import EOLTesterGUI    # Import TestConsole
 from comport_settings import ComPortSettings  # Add this import
 from dataconsole import DataConsole  # Add this import
 from adminconsole import AdminConsole  # Add this import
+from vision_settings import VisionSettings
 from helpconsole import HelpConsole, ContactConsole
 from login_form import prompt_login
 import config
@@ -236,6 +237,7 @@ class MainConsole(tk.Tk):
         entries = (
             ('btn_com_settings', 'swap', "COM\nPorts", self.com_port_settings_click),
             ('btn_settings', 'gear', "Settings", self.settings_click),
+            ('btn_vision', 'camera', "Vision", self.vision_click),
             ('btn_test', 'play', "Test", self.test_click),
             ('btn_work_data', 'bars', "Work\nData", self.work_data_click),
             ('btn_admin', 'shield', "Admin", self.admin_click),
@@ -332,7 +334,7 @@ class MainConsole(tk.Tk):
         folders = self.archive_folders()
         ready = bool(machine_id) and folders is not None
 
-        for btn in (self.btn_com_settings, self.btn_settings,
+        for btn in (self.btn_com_settings, self.btn_settings, self.btn_vision,
                     self.btn_test, self.btn_work_data):
             btn.set_enabled(ready)
 
@@ -580,6 +582,14 @@ class MainConsole(tk.Tk):
         self.open_page("Model Settings",
                        lambda page: WorkspaceApp(page, user=user),
                        entry=self.btn_settings)
+
+    def vision_click(self):
+        # Teaching or deleting a part changes what passes on the line, so
+        # this is behind a login like Settings.
+        if prompt_login(self) is None:
+            return
+
+        self.open_page("Vision Settings", VisionSettings, entry=self.btn_vision)
 
     def test_click(self):
         self.open_page(

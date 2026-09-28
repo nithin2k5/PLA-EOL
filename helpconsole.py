@@ -117,7 +117,7 @@ class HelpConsole(Page):
         self.paragraph(setup,
                        "A machine has to be identified and given somewhere to "
                        "archive to before it can be tested on. Until both are "
-                       "set, COM Ports, Settings, Test and Work Data stay "
+                       "set, COM Ports, Settings, Vision, Test and Work Data stay "
                        "greyed out in the navigation.")
         self.rows(setup, (
             ("Machine ID", "Identifies this machine on the test records."),
@@ -136,6 +136,9 @@ class HelpConsole(Page):
                           "cameras and scanners."),
             ("Settings", "The models each part number is tested against. "
                          "Asks for a login."),
+            ("Vision", "The camera, the pass threshold, and teaching and "
+                       "testing the parts the camera checks. Asks for a "
+                       "login."),
             ("Test", "Runs a part through its test cycle. This is the console "
                      "the application opens into."),
             ("Work Data", "Search past results by part number, date and "
@@ -146,7 +149,7 @@ class HelpConsole(Page):
 
         login = self.card(body, "Signing in", icon='shield')
         self.paragraph(login,
-                       "Settings and Admin ask for an employee number and "
+                       "Settings, Vision and Admin ask for an employee number and "
                        "password. The other consoles open without one.")
         self.paragraph(login,
                        "Employee accounts are added and deactivated in the "
