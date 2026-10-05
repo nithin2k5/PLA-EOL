@@ -314,16 +314,19 @@ def dominant_colour(patch: np.ndarray) -> Tuple[Optional[str], int]:
     return best, best_area
 
 
-def teach(part_number: str, frame: np.ndarray, roi: dict,
-          colour: Optional[str] = None, count: Optional[int] = None) -> dict:
-    """Read a good part's stripes from the box and save them for the part.
+def read_stripes(frame: np.ndarray, roi: dict, colour: Optional[str] = None,
+                 count: Optional[int] = None) -> Tuple[dict, List[np.ndarray]]:
+    """Read a good part's stripes from the box, without saving anything.
 
-    `colour` and `count` override what was read from the image. Raises
-    ValueError with an operator-readable reason when no stripes are found.
+    Returns the model it would save (less the part number) and the outline
+    of each stripe in frame coordinates, so the operator can see what was
+    found before saving. `colour` and `count` override what was read from the
+    image. Raises ValueError with an operator-readable reason when no stripes
+    are found.
     """
     if roi["width"] < 8 or roi["height"] < 8:
         raise ValueError("The box is too small. Draw it round the whole stripe group.")
-    patch, _ = _crop(frame, roi, 0.0)
+    patch, (x0, y0, _, _) = _crop(frame, roi, 0.0)
 
     if colour is None:
         colour, _ = dominant_colour(patch)
@@ -356,8 +359,6 @@ def teach(part_number: str, frame: np.ndarray, roi: dict,
         width = span / count
 
     model = {
-        "part_number": part_number,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "roi": {k: int(roi[k]) for k in ("x", "y", "width", "height")},
         "frame_size": [int(frame.shape[1]), int(frame.shape[0])],
         "colour": colour,
@@ -370,6 +371,16 @@ def teach(part_number: str, frame: np.ndarray, roi: dict,
         "pitch": (span - width) / (count - 1) if count > 1 and count == found else 0.0,
         "size_tolerance": SIZE_TOLERANCE,
     }
+    boxes = [b["box"] + np.array([x0, y0], np.float32) for b in bands]
+    return model, boxes
+
+
+def teach(part_number: str, frame: np.ndarray, roi: dict,
+          colour: Optional[str] = None, count: Optional[int] = None) -> dict:
+    """Read a good part's stripes from the box and save them for the part."""
+    model, _ = read_stripes(frame, roi, colour, count)
+    model = dict(part_number=part_number,
+                 created=time.strftime("%Y-%m-%dT%H:%M:%S"), **model)
     save_model(model)
     return model
 

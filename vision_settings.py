@@ -77,16 +77,17 @@ def _camera_source() -> str:
     return load_vision_config().get("camera_source", "cam1")
 
 
-def _load_cam_cfg() -> dict:
+def _load_cam_cfg(source=None) -> dict:
+    """Saved device for a camera source; the inspection camera by default."""
     from vision_engine import load_camera_config
-    index, width, height = load_camera_config(_camera_source())
+    index, width, height = load_camera_config(source or _camera_source())
     return {"index": index, "width": width, "height": height, "enabled": index >= 0}
 
 
-def _save_cam_cfg(index: int, width: int, height: int, enabled: bool):
-    """Store the inspection camera; a disabled camera is saved as index -1."""
+def _save_cam_cfg(index: int, width: int, height: int, enabled: bool, source=None):
+    """Store a camera; a disabled camera is saved as index -1."""
     from vision_engine import save_camera_config
-    save_camera_config(_camera_source(), index if enabled else -1, width, height)
+    save_camera_config(source or _camera_source(), index if enabled else -1, width, height)
 
 
 def _probe_cameras(max_index: int = 6):
@@ -873,6 +874,105 @@ def render(parent):
 
     btn_cam_cfg.configure(command=_configure_camera)
 
+    # ── Right rail: stripe check (camera 2) ────────────────────────────────
+    # Camera 2 checks the painted stripes on the cable. It has its own device
+    # and its own taught parts, kept apart from the template datasets above.
+    from vision_engine import stripe_check
+
+    stripe_card = _card(rail, "Stripe Check", "camera 2", icon="camera")
+    stripe_card.pack(fill="x", padx=(0, 6), pady=(12, 0))
+    sb_ = stripe_card.body
+    cam2_device = _kv_row(sb_, "Device", "—", mono=True)
+
+    stripe_tree = ttk.Treeview(sb_, columns=("part", "stripes"), show="headings",
+                               selectmode="browse", height=5)
+    stripe_tree.heading("part", text="PART NUMBER")
+    stripe_tree.heading("stripes", text="STRIPES")
+    stripe_tree.column("part", width=150, anchor="w")
+    stripe_tree.column("stripes", width=110, anchor="center")
+    stripe_tree.tag_configure("empty", foreground=TXT_FAINT)
+    stripe_tree.pack(fill="x", pady=(8, 0))
+
+    stripe_btns = tk.Frame(sb_, bg=PANEL)
+    stripe_btns.pack(fill="x", pady=(10, 0))
+    stripe_btns.columnconfigure((0, 1), weight=1, uniform="stripe")
+    btn_s_teach = _btn(stripe_btns, "Teach New", BTN_SUCCESS, icon="box")
+    btn_s_teach.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+    btn_s_reteach = _btn(stripe_btns, "Re-teach", BTN_NEUTRAL, icon="refresh")
+    btn_s_reteach.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+    btn_s_test = _btn(stripe_btns, "Run Test", BTN_PRIMARY, icon="play")
+    btn_s_test.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(6, 0))
+    btn_s_del = _btn(stripe_btns, "Delete", BTN_DANGER, icon="alert")
+    btn_s_del.grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(6, 0))
+    btn_cam2_cfg = _btn(sb_, "Configure Camera 2…", BTN_NEUTRAL, icon="gear")
+    btn_cam2_cfg.pack(fill="x", pady=(6, 0))
+
+    def _stripe_selection():
+        sel = stripe_tree.selection()
+        return sel[0] if sel and sel[0] != "!none" else None
+
+    def _on_stripe_select(event=None):
+        chosen = _stripe_selection() is not None
+        for b in (btn_s_reteach, btn_s_test, btn_s_del):
+            _set_btn_enabled(b, chosen)
+
+    def _refresh_stripes(select=None):
+        if not alive["page"]:
+            return
+        cam2 = _load_cam_cfg(stripe_check.CAMERA_SOURCE)
+        cam2_device.config(
+            text=("Camera %d  ·  %dx%d" % (cam2["index"], cam2["width"], cam2["height"])
+                  if cam2["enabled"] else "Not configured"),
+            fg=TXT if cam2["enabled"] else WARN)
+
+        remembered = select or _stripe_selection()
+        stripe_tree.delete(*stripe_tree.get_children())
+        for pno in stripe_check.taught_parts():
+            model = stripe_check.load_model(pno) or {}
+            stripe_tree.insert("", "end", iid=pno, values=(
+                pno, "%s × %s" % (model.get("colour", "?"), model.get("count", "?"))))
+        if not stripe_tree.get_children():
+            stripe_tree.insert("", "end", iid="!none", tags=("empty",),
+                               values=("No parts taught", ""))
+        if remembered and stripe_tree.exists(remembered):
+            stripe_tree.selection_set(remembered)
+            stripe_tree.see(remembered)
+        _on_stripe_select()
+
+    def _stripe_teach(part_number=None):
+        saved = _open_stripe_teach(parent, part_number)
+        if saved:
+            _refresh_stripes(select=saved)
+
+    def _stripe_test():
+        pno = _stripe_selection()
+        if pno:
+            _open_stripe_test(parent, pno)
+
+    def _stripe_delete():
+        pno = _stripe_selection()
+        if not pno or not messagebox.askyesno(
+                "Delete Stripe Check",
+                "Delete the stripe check for part “%s”?\n\n"
+                "Camera 2 will no longer check this part on the line." % pno,
+                parent=parent):
+            return
+        stripe_check.delete_model(pno)
+        _refresh_stripes()
+
+    def _configure_cam2():
+        if _open_camera_dialog(parent, stripe_check.CAMERA_SOURCE,
+                               "Stripe Camera (Camera 2)"):
+            _refresh_stripes()
+
+    btn_s_teach.configure(command=lambda: _stripe_teach(None))
+    btn_s_reteach.configure(command=lambda: _stripe_teach(_stripe_selection()))
+    btn_s_test.configure(command=_stripe_test)
+    btn_s_del.configure(command=_stripe_delete)
+    btn_cam2_cfg.configure(command=_configure_cam2)
+    stripe_tree.bind("<<TreeviewSelect>>", _on_stripe_select)
+    stripe_tree.bind("<Double-1>", lambda e: _stripe_test())
+
     # ── Right rail: part coverage ────────────────────────────────────────────
     # The parts table audits datasets — files that exist and whether they're
     # wired up. This audits the other direction: real parts in the master that
@@ -1131,6 +1231,7 @@ def render(parent):
 
     _refresh_table()
     _refresh_camera()
+    _refresh_stripes()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2138,17 +2239,21 @@ def _prompt_part_number(parent, title, prompt, taken=()):
 # Camera configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _open_camera_dialog(parent):
-    """Pick and verify the inspection camera. Returns True if the config changed."""
+def _open_camera_dialog(parent, source=None, title="Inspection Camera"):
+    """Pick and verify a camera. Returns True if the config changed.
+
+    `source` names the camera in camera_cfg.ini; by default it is the one
+    template matching uses.
+    """
     if not _cv2_ok or not _pil_ok:
         messagebox.showerror("Camera", "OpenCV and Pillow are required.", parent=parent)
         return False
 
     from vision_engine import camera
 
-    cam = _load_cam_cfg()
+    cam = _load_cam_cfg(source)
     win = _dialog(parent, "Camera Configuration", 820, 580)
-    _dialog_header(win, "Inspection Camera",
+    _dialog_header(win, title,
                    "The preview is the exact feed inspection will use.")
 
     alive = {"v": True}
@@ -2318,7 +2423,7 @@ def _open_camera_dialog(parent):
                     parent=win):
                 return
         try:
-            _save_cam_cfg(idx, w, h, idx >= 0)
+            _save_cam_cfg(idx, w, h, idx >= 0, source)
         except OSError as e:
             messagebox.showerror("Camera", "Could not save the camera:\n\n%s" % e,
                                  parent=win)
@@ -2344,6 +2449,574 @@ def _open_camera_dialog(parent):
     _tick()
     parent.wait_window(win)
     return changed["v"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stripe check (camera 2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _with_outlines(img, outlines, color_hex):
+    """A copy of `img` with each stripe outline drawn on it."""
+    out = img.copy()
+    r, g, b = (int(color_hex[i:i + 2], 16) for i in (1, 3, 5))
+    thick = max(1, round(max(img.shape[:2]) / 400))
+    for o in outlines:
+        cv2.polylines(out, [np.round(o).astype(np.int32)], True, (b, g, r), thick)
+    return out
+
+
+def _open_stripe_teach(parent, part_number=None):
+    """Teach or re-teach one part's stripes. Returns the saved part number, or None."""
+    if not _cv2_ok or not _pil_ok:
+        messagebox.showerror("Vision", "OpenCV and Pillow are required to teach a part.",
+                             parent=parent)
+        return None
+
+    from vision_engine import camera, stripe_check
+
+    cam = _load_cam_cfg(stripe_check.CAMERA_SOURCE)
+    existing_parts = set(stripe_check.taught_parts())
+    reteach = part_number is not None
+    previous = stripe_check.load_model(part_number) if reteach else None
+
+    win = _dialog(parent, "Teach Stripes", 1120, 720)
+    _dialog_header(
+        win,
+        "Re-teach stripes — “%s”" % part_number if reteach else "Teach Stripes",
+        "Capture a good part on camera 2, then box its group of stripes.")
+
+    alive = {"v": True}
+    live = {"on": False}
+    stream = {"s": None}
+    # The frame being taught from, and what was read from it
+    state = {"frame": None, "label": "", "model": None, "outlines": [], "error": None}
+    # Once the operator picks a colour, a redrawn box keeps it
+    picked = {"colour": None}
+    result = {"saved": None}
+
+    foot_in = _dialog_footer(win)
+    checklist = tk.Label(foot_in, text="", bg=PANEL, fg=TXT_DIM, font=(MONO, 11),
+                         anchor="w", justify="left")
+    checklist.pack(side="left")
+    btn_save = _btn(foot_in, "Save", BTN_SUCCESS, font_size=12, pady=8, icon="check")
+    btn_save.pack(side="right")
+    btn_cancel = _btn(foot_in, "Cancel", BTN_NEUTRAL, font_size=12, pady=8)
+    btn_cancel.pack(side="right", padx=(0, 8))
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    # ── Left: image view + view toolbar ────────────────────────────────────
+    left = tk.Frame(body, bg=BG)
+    left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+    left.rowconfigure(0, weight=1)
+    left.columnconfigure(0, weight=1)
+
+    view_wrap = tk.Frame(left, bg=LINE)
+    view_wrap.grid(row=0, column=0, sticky="nsew")
+    view = RoiView(view_wrap, on_change=lambda r, final: _roi_changed(r, final))
+    view.pack(fill="both", expand=True, padx=1, pady=1)
+
+    view_bar = tk.Frame(left, bg=BG)
+    view_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+    frame_lbl = tk.Label(view_bar, text="", bg=BG, fg=TXT_DIM, font=(MONO, 11))
+    frame_lbl.pack(side="right")
+    btn_capture = _btn(view_bar, "Capture Frame", BTN_SUCCESS, icon="camera")
+    btn_live = _btn(view_bar, "Live View", BTN_NEUTRAL, icon="play")
+    btn_import = _btn(view_bar, "Import Image…", BTN_NEUTRAL, icon="document")
+
+    # ── Right: steps ───────────────────────────────────────────────────────
+    # Scrolls, so the colour and count stay reachable on a short screen
+    rail_scroll = ui.scrollable(body, bg=BG)
+    rail_scroll.configure(width=340)
+    rail_scroll.grid(row=0, column=1, sticky="ns")
+    rail_scroll.grid_propagate(False)
+    rail = rail_scroll.body
+
+    def _note(parent_, text, fg=TXT_FAINT):
+        lbl = tk.Label(parent_, text=text, bg=BG, fg=fg, font=(FONT, 10),
+                       wraplength=270, justify="left", anchor="w")
+        lbl.pack(fill="x")
+        return lbl
+
+    s1, b1 = _step(rail, 1, "Part number")
+    master_parts = _fetch_master_parts()
+    ent_pno = _PnoField(s1, master_parts)
+    ent_pno.pack(fill="x", ipady=5)
+    pno_note = _note(s1, "")
+    if master_parts is None:
+        _note(s1, "Could not reach the model master — a typed value won't be "
+                  "checked against it.", WARN)
+    if reteach:
+        ent_pno.set(part_number)
+        ent_pno.lock()
+        pno_note.config(text="Saving replaces this part's stripe check.", fg=WARN)
+    else:
+        ent_pno.focus_set()
+
+    s2, b2 = _step(rail, 2, "Good part")
+    _note(s2, "Put a good part in the fixture and capture it, or import a photo "
+              "taken by camera 2.")
+    frame_note = tk.Label(s2, text="", bg=BG, fg=TXT_DIM, font=(FONT, 11, "bold"),
+                          anchor="w")
+    frame_note.pack(fill="x", pady=(4, 0))
+
+    s3, b3 = _step(rail, 3, "Stripe box")
+    _note(s3, "Draw the box round the whole group of stripes, with a little cable "
+              "either side. Every part is checked inside this box.")
+    roi_lbl = tk.Label(s3, text="Not drawn", bg=BG, fg=WARN,
+                       font=(MONO, 12, "bold"), anchor="w")
+    roi_lbl.pack(fill="x", pady=(4, 0))
+
+    s4, b4 = _step(rail, 4, "Stripes found")
+    found_lbl = tk.Label(s4, text="—", bg=BG, fg=TXT_DIM, font=(FONT, 18, "bold"),
+                         anchor="w")
+    found_lbl.pack(fill="x")
+
+    pick_row = tk.Frame(s4, bg=BG)
+    pick_row.pack(fill="x", pady=(8, 0))
+    tk.Label(pick_row, text="Colour", bg=BG, fg=TXT_DIM, font=(FONT, 11),
+             width=7, anchor="w").pack(side="left")
+    colour_var = tk.StringVar()
+    cmb_colour = ttk.Combobox(pick_row, textvariable=colour_var, state="readonly",
+                              values=list(stripe_check.COLOURS), width=10,
+                              font=(FONT, 11))
+    cmb_colour.pack(side="left")
+    tk.Label(pick_row, text="Count", bg=BG, fg=TXT_DIM, font=(FONT, 11)).pack(
+        side="left", padx=(14, 6))
+    count_var = tk.StringVar()
+    spn_count = ttk.Spinbox(pick_row, from_=1, to=9, width=4, textvariable=count_var,
+                            font=(FONT, 11), state="readonly")
+    spn_count.pack(side="left")
+    count_note = _note(s4, "")
+    found_note = _note(s4, "")
+
+    # ── Behaviour ──────────────────────────────────────────────────────────
+
+    def _count():
+        try:
+            return int(count_var.get())
+        except ValueError:
+            return None
+
+    def _gates():
+        return {
+            "Part number": bool(ent_pno.get().strip()),
+            "Good part": state["frame"] is not None,
+            "Box": view.get_roi() is not None,
+            "Stripes": state["model"] is not None,
+        }
+
+    def _refresh_gates(*_a):
+        gates = _gates()
+        checklist.config(text="   ".join(
+            ("✓ " if ok else "○ ") + name for name, ok in gates.items()))
+        _set_btn_enabled(btn_save, all(gates.values()))
+        for badge, ok in zip((b1, b2, b3, b4), gates.values()):
+            badge.config(bg=OK_GREEN if ok else ui.SUBTLE,
+                         fg=ui.TEXT_ON_DARK if ok else TXT)
+        if not reteach:
+            pno = ent_pno.get().strip()
+            if pno and pno in existing_parts:
+                pno_note.config(text="“%s” already has a stripe check — saving "
+                                     "replaces it." % pno, fg=WARN)
+            else:
+                pno_note.config(text="", fg=TXT_FAINT)
+
+    def _show_frame():
+        """The taught frame, with the stripes that were found outlined."""
+        if state["frame"] is None:
+            return
+        img = state["frame"]
+        if state["outlines"]:
+            img = _with_outlines(img, state["outlines"], ui.ACCENT_FILL)
+        view.set_image(img)
+
+    def _analyse():
+        """Read the stripes inside the box, as saving would."""
+        state["model"], state["outlines"], state["error"] = None, [], None
+        roi = view.get_roi()
+        if state["frame"] is not None and roi is not None:
+            try:
+                state["model"], state["outlines"] = stripe_check.read_stripes(
+                    state["frame"], roi, colour=picked["colour"])
+            except ValueError as e:
+                state["error"] = str(e)
+
+        model = state["model"]
+        if model is not None:
+            colour_var.set(model["colour"])
+            count_var.set(str(model["count"]))
+            found_lbl.config(text="%s × %d" % (model["colour"], model["count"]),
+                             fg=OK_GREEN)
+            found_note.config(
+                text="Each stripe is about %.0f px wide; the group is %.0f px long. "
+                     "The found stripes are outlined in the picture."
+                     % (model["stripe_width"], model["span"]), fg=TXT_FAINT)
+        else:
+            found_lbl.config(text="—", fg=TXT_DIM)
+            found_note.config(text=state["error"] or "", fg=WARN)
+        _check_count()
+        _show_frame()
+        _refresh_gates()
+
+    def _check_count(*_a):
+        model = state["model"]
+        n = _count()
+        if model is not None and n is not None and n != model["count"]:
+            count_note.config(
+                text="%d were found, but the check will expect %d. Only do this when "
+                     "stripes touch and can't be told apart." % (model["count"], n),
+                fg=WARN)
+        else:
+            count_note.config(text="", fg=TXT_FAINT)
+
+    def _roi_changed(roi, final=True):
+        if roi:
+            roi_lbl.config(text="%d × %d px" % (roi["width"], roi["height"]), fg=OK_GREEN)
+        else:
+            roi_lbl.config(text="Not drawn", fg=WARN)
+        if final:
+            _analyse()
+
+    def _on_colour(event=None):
+        picked["colour"] = colour_var.get() or None
+        _analyse()
+
+    def _set_live(on):
+        live["on"] = on and stream["s"] is not None
+        if live["on"]:
+            view.set_editable(False)
+            view.set_hint("Live view — capture a frame to draw the box")
+            frame_lbl.config(text="LIVE  ·  camera %d" % cam["index"])
+        else:
+            view.set_editable(True)
+            view.set_hint("Drag to box the stripes")
+        _paint_buttons()
+
+    def _paint_buttons():
+        has_cam = stream["s"] is not None
+        for b in (btn_capture, btn_live, btn_import):
+            b.pack_forget()
+        if has_cam:
+            btn_capture.pack(side="left")
+            btn_live.pack(side="left", padx=(8, 0))
+            _set_btn_enabled(btn_live, not live["on"])
+            btn_import.pack(side="left", padx=(8, 0))
+        else:
+            btn_import.pack(side="left")
+
+    def _use_frame(img, label):
+        roi = view.get_roi()
+        state["frame"], state["label"] = img, label
+        live["on"] = False
+        view.set_image(img)
+        # Keep the box across captures of the same size; on a re-teach start
+        # from the box the part was taught with
+        if roi is None and previous and previous.get("frame_size") == [img.shape[1], img.shape[0]]:
+            roi = previous["roi"]
+        view.set_roi(roi, notify=False)
+        _set_live(False)
+        frame_lbl.config(text="%s  ·  %d x %d" % (label, img.shape[1], img.shape[0]))
+        frame_note.config(text="Captured (%s)" % label, fg=OK_GREEN)
+        _roi_changed(view.get_roi())
+
+    def _capture():
+        s = stream["s"]
+        if s is None:
+            return
+        frame = s.latest() if live["on"] else s.read(timeout=3.0)
+        if frame is None:
+            messagebox.showwarning("Capture", "No frame from camera 2 yet.", parent=win)
+            return
+        _use_frame(frame.copy(), "camera %d" % cam["index"])
+
+    def _import():
+        path = filedialog.askopenfilename(
+            parent=win, title="Select Image of a Good Part",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        if not path:
+            return
+        img = _read_image(path)
+        if img is None:
+            messagebox.showerror("Import", "Could not read that image file.", parent=win)
+            return
+        _use_frame(img, os.path.basename(path))
+
+    def _save():
+        pno = ent_pno.get().strip()
+        roi = view.get_roi()
+        if not all(_gates().values()):
+            return
+        if not reteach and pno in existing_parts and not messagebox.askyesno(
+                "Replace Stripe Check",
+                "“%s” already has a stripe check.\n\nReplace it?" % pno, parent=win):
+            return
+        fh, fw = state["frame"].shape[:2]
+        if cam["enabled"] and (fw, fh) != (cam["width"], cam["height"]):
+            if not messagebox.askyesno(
+                    "Resolution Mismatch",
+                    "This image is %d×%d but camera 2 is set to %d×%d.\n\n"
+                    "The check will refuse frames of a different size, so this part "
+                    "will fail on the line until it is re-taught.\n\nSave anyway?"
+                    % (fw, fh, cam["width"], cam["height"]), parent=win):
+                return
+        try:
+            stripe_check.teach(pno, state["frame"], roi,
+                               colour=picked["colour"], count=_count())
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Save Failed", str(e), parent=win)
+            return
+        result["saved"] = pno
+        _close()
+
+    def _close():
+        alive["v"] = False
+        if stream["s"] is not None:
+            try:
+                stream["s"].release()
+            except Exception:
+                pass
+            stream["s"] = None
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+
+    btn_capture.configure(command=_capture)
+    btn_import.configure(command=_import)
+    btn_live.configure(command=lambda: _set_live(True))
+    btn_save.configure(command=_save)
+    btn_cancel.configure(command=_close)
+    cmb_colour.bind("<<ComboboxSelected>>", _on_colour)
+    count_var.trace_add("write", _check_count)
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.bind("<Escape>", lambda e: _close())
+    ent_pno.bind("<KeyRelease>", _refresh_gates)
+
+    # ── Camera bring-up ────────────────────────────────────────────────────
+    if cam["enabled"]:
+        stream["s"] = camera.acquire(cam["index"], cam["width"], cam["height"])
+        view.set_placeholder("Starting camera %d…" % cam["index"])
+        _set_live(True)
+    else:
+        view.set_placeholder("Camera 2 is not configured\n\n"
+                             "Import a photo of a good part, or set camera 2 up first.")
+        _set_live(False)
+
+    def _tick():
+        if not alive["v"]:
+            return
+        s = stream["s"]
+        if live["on"] and s is not None:
+            frame = s.latest()
+            if frame is not None:
+                view.set_image(frame)
+            elif not s.is_alive():
+                live["on"] = False
+                view.set_image(None)
+                view.set_placeholder("Camera %d stopped responding" % cam["index"])
+                frame_lbl.config(text="CAMERA UNAVAILABLE")
+        try:
+            win.after(60, _tick)
+        except Exception:
+            pass
+
+    _paint_buttons()
+    _refresh_gates()
+    _tick()
+
+    parent.wait_window(win)
+    return result["saved"]
+
+
+def _open_stripe_test(parent, part_number):
+    """Run the production stripe check on camera 2, or on a still image."""
+    from vision_engine import stripe_check
+
+    win = _dialog(parent, "Stripe Test", 900, 660)
+    _dialog_header(win, "Stripe Test — %s" % part_number,
+                   "Runs the same check the test cycle uses — on camera 2, or a "
+                   "still image you supply.")
+
+    foot_in = _dialog_footer(win)
+
+    verdict = tk.Frame(win, bg=ui.SUBTLE, height=54)
+    verdict.pack(fill="x")
+    verdict.pack_propagate(False)
+    verdict_lbl = tk.Label(verdict, text="RUNNING…", bg=ui.SUBTLE, fg=TXT_DIM,
+                           font=(FONT, 22, "bold"))
+    verdict_lbl.pack(side="left", padx=18)
+    verdict_note = tk.Label(verdict, text="", bg=ui.SUBTLE, fg=TXT_DIM,
+                            font=(FONT, 11), anchor="e", justify="right")
+    verdict_note.pack(side="right", padx=18)
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=14, pady=12)
+    body.columnconfigure(0, weight=1)
+    body.rowconfigure(0, weight=1)
+
+    view_wrap = tk.Frame(body, bg=LINE)
+    view_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+    view = RoiView(view_wrap, editable=False)
+    view.pack(fill="both", expand=True, padx=1, pady=1)
+    view.set_placeholder("Capturing…")
+
+    rail = tk.Frame(body, bg=BG, width=260)
+    rail.grid(row=0, column=1, sticky="ns")
+    rail.pack_propagate(False)
+
+    metrics = _card(rail, "Result", icon="chart")
+    metrics.pack(fill="x")
+    mb = metrics.body
+    m_source = _kv_row(mb, "Source", "Camera 2")
+    m_expected = _kv_row(mb, "Expected", "—", mono=True)
+    m_found = _kv_row(mb, "Found", "—", mono=True)
+    m_time = _kv_row(mb, "Time", "—", mono=True)
+
+    hint = tk.Label(rail, text="", bg=BG, fg=TXT_DIM, font=(FONT, 10),
+                    wraplength=240, justify="left", anchor="w")
+    hint.pack(fill="x", pady=(12, 0))
+
+    btn_close = _btn(foot_in, "Close", BTN_NEUTRAL, font_size=12, pady=8)
+    btn_close.pack(side="right")
+    btn_rerun = _btn(foot_in, "Run Again", BTN_PRIMARY, font_size=12, pady=8,
+                     icon="refresh")
+    btn_rerun.pack(side="right", padx=(0, 8))
+    btn_source = _btn(foot_in, "Test Image…", BTN_NEUTRAL, font_size=12, pady=8,
+                      icon="document")
+    btn_source.pack(side="right", padx=(0, 8))
+
+    alive = {"v": True}
+    source = {"kind": "camera", "image": None, "label": None}
+    busy = {"v": False}
+    pending = {"v": False}
+
+    def _paint_verdict(fill):
+        verdict.config(bg=fill)
+        for w_ in (verdict_lbl, verdict_note):
+            w_.config(bg=fill)
+
+    def _run():
+        if not alive["v"]:
+            return
+        if busy["v"]:
+            pending["v"] = True
+            return
+        busy["v"] = True
+        verdict_lbl.config(text="RUNNING…", fg=TXT_DIM)
+        verdict_note.config(text="")
+        _paint_verdict(ui.SUBTLE)
+        _set_btn_enabled(btn_rerun, False)
+
+        frame = source["image"] if source["kind"] == "image" else None
+        out = {}
+
+        def _work():
+            try:
+                out["result"] = stripe_check.inspect(part_number, frame=frame)
+            except Exception as e:
+                out["error"] = e
+
+        worker = threading.Thread(target=_work, daemon=True)
+        worker.start()
+
+        def _wait():
+            if not alive["v"]:
+                return
+            if worker.is_alive():
+                win.after(80, _wait)
+                return
+            busy["v"] = False
+            if pending["v"]:
+                pending["v"] = False
+                _run()
+                return
+            _set_btn_enabled(btn_rerun, True)
+            if "error" in out:
+                verdict_lbl.config(text="ERROR", fg=WARN)
+                verdict_note.config(text=str(out["error"]), fg=WARN)
+                _paint_verdict(ui.ROW_BAND)
+                return
+            _show(out["result"])
+
+        _wait()
+
+    def _show(result):
+        color = _VERDICT_INK.get(result.judgement, TXT_DIM)
+        _paint_verdict(_VERDICT_FILL.get(result.judgement, ui.SUBTLE))
+        verdict_lbl.config(text=result.judgement, fg=color)
+        verdict_note.config(text=result.error or "Stripes match", fg=color)
+
+        m_source.config(text="Camera 2" if source["kind"] == "camera" else source["label"])
+        m_expected.config(text="%s × %d" % (result.expected_colour, result.expected_count)
+                          if result.expected_colour else "—", fg=TXT)
+        m_found.config(text=result.seen.replace(" x", " × ") if result.seen else "—",
+                       fg=color)
+        m_time.config(text="%d ms" % result.processing_time_ms, fg=TXT)
+
+        if result.frame is not None:
+            view.set_image(_with_outlines(result.frame, result.stripe_boxes, ui.ACCENT_FILL))
+            view.set_accent(color)
+            if result.search_box:
+                x, y, bw, bh = result.search_box
+                view.set_roi({"x": x, "y": y, "width": bw, "height": bh}, notify=False)
+            view.set_hint("Searched inside the box; stripes of the expected colour "
+                          "are outlined")
+        else:
+            view.set_image(None)
+            view.set_placeholder(result.error or "No frame captured")
+
+        if result.judgement == "NG":
+            hint.config(
+                text="If this part is good, check the lighting and that it sits in the "
+                     "fixture as it did when taught, then re-teach it if it still fails.",
+                fg=WARN)
+        elif result.judgement == "ERROR":
+            hint.config(text="Nothing was judged — fix the error above and run again.",
+                        fg=WARN)
+        else:
+            hint.config(text="", fg=TXT_DIM)
+
+    def _pick_image():
+        if source["kind"] == "image":
+            # Already testing an image — the button toggles back to the camera.
+            source["kind"], source["image"], source["label"] = "camera", None, None
+            btn_source.configure(text="Test Image…")
+            _run()
+            return
+        path = filedialog.askopenfilename(
+            parent=win, title="Select Test Image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")])
+        if not path:
+            return
+        img = _read_image(path)
+        if img is None:
+            messagebox.showerror("Test Image", "Could not read that image file.", parent=win)
+            return
+        source["kind"], source["image"], source["label"] = "image", img, os.path.basename(path)
+        btn_source.configure(text="Use Camera 2")
+        _run()
+
+    def _close():
+        alive["v"] = False
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        win.destroy()
+
+    btn_rerun.configure(command=_run)
+    btn_source.configure(command=_pick_image)
+    btn_close.configure(command=_close)
+    win.protocol("WM_DELETE_WINDOW", _close)
+    win.bind("<Escape>", lambda e: _close())
+
+    _run()
+    parent.wait_window(win)
 
 
 def main():
