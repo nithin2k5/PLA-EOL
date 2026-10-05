@@ -2715,7 +2715,8 @@ def _open_stripe_teach(parent, part_number=None):
 
     s3, b3 = _step(rail, 3, "Stripe box")
     _note(s3, "Draw the box round the whole group of stripes, with a little cable "
-              "either side. Every part is checked inside this box.")
+              "either side. It only shows which stripes to learn: parts are found "
+              "anywhere in the picture.")
     roi_lbl = tk.Label(s3, text="Not drawn", bg=BG, fg=WARN,
                        font=(MONO, 12, "bold"), anchor="w")
     roi_lbl.pack(fill="x", pady=(4, 0))
@@ -3113,19 +3114,26 @@ def _open_stripe_test(parent, part_number):
             view.set_image(result.frame)
             view.set_outlines(result.stripe_boxes)
             view.set_accent(color)
-            if result.search_box:
-                x, y, bw, bh = result.search_box
-                view.set_roi({"x": x, "y": y, "width": bw, "height": bh}, notify=False)
-            view.set_hint("Searched inside the box; stripes of the expected colour "
-                          "are outlined")
+            # Box the group that was judged, with a little room round it
+            view.set_roi(None, notify=False)
+            if result.found_box:
+                x, y, bw, bh = result.found_box
+                pad = max(4, max(bw, bh) // 4)
+                fh, fw = result.frame.shape[:2]
+                x0, y0 = max(0, x - pad), max(0, y - pad)
+                view.set_roi({"x": x0, "y": y0,
+                              "width": min(fw, x + bw + pad) - x0,
+                              "height": min(fh, y + bh + pad) - y0}, notify=False)
+            view.set_hint("The whole picture was searched; the group judged is boxed")
         else:
             view.set_image(None)
             view.set_placeholder(result.error or "No frame captured")
 
         if result.judgement == "NG":
             hint.config(
-                text="If this part is good, check the lighting and that it sits in the "
-                     "fixture as it did when taught, then re-teach it if it still fails.",
+                text="If this part is good, check the lighting and that camera 2 sees "
+                     "it from the same distance as when it was taught, then re-teach it "
+                     "if it still fails.",
                 fg=WARN)
         elif result.judgement == "ERROR":
             hint.config(text="Nothing was judged — fix the error above and run again.",

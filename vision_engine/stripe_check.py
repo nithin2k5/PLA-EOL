@@ -4,19 +4,23 @@ vision_engine/stripe_check.py
 Checks the painted stripes on a cable with the second camera ("cam2").
 
 Each part number has a group of painted bands round its cable, for example
-three yellow stripes on a black cable. A check passes when the taught box
-holds the expected number of stripes, in the expected colour, at the size the
-good part showed when it was taught.
+three yellow stripes on a black cable. A check passes when the frame holds a
+group of the expected number of stripes, in the expected colour, at the size
+the good part showed when it was taught.
+
+The part does not have to sit in a fixed place: the whole frame is searched,
+and the cable may lie at any angle.
 
 Methodology:
   - Teach: the operator boxes the stripe group on a good part. The stripes'
-    colour, count, size and the direction of the cable are read from that box
-    and saved per part number.
-  - Inspect: pixels of the expected colour inside the box are grouped into
-    bands. Specks of that colour on the background are dropped because they
-    are far smaller than a taught stripe. The bands are then counted along the
-    cable, so stripes that touch still count separately.
-  - Result: OK only if count, colour, stripe size and group length all match.
+    colour, count, size and spacing are read from that box and saved per
+    part number. The box only says which stripes to learn from.
+  - Inspect: pixels of the expected colour anywhere in the frame are grouped
+    into bands. Bands far from the taught stripe size, such as specks on the
+    background or a mat of the same colour, are dropped. Bands lying close
+    together form a group, and each group is counted along its own cable
+    direction, so stripes that touch still count separately.
+  - Result: OK if any group matches the taught count and group length.
 """
 import json
 import math
@@ -43,9 +47,16 @@ COLOURS = ("white", "red", "yellow", "green", "blue", "purple")
 # a different part. Hand-painted bands vary, so this is loose.
 SIZE_TOLERANCE = 0.4
 
-# The part is fixtured, but not to the pixel: the search covers this much of
-# the box's own size again on every side.
-SEARCH_MARGIN = 0.25
+# Bands belong to one group while each is within this many stripe pitches
+# of another
+GROUP_LINK = 1.6
+
+# Paint stands out from the cable and background round it; a bright spot
+# on a pale bench or a glint on metal barely differs from its surroundings.
+# A group must differ by at least this much (CIELAB distance), and by at
+# least this share of what the good part showed when taught.
+MIN_CONTRAST = 18.0
+CONTRAST_SHARE = 0.35
 
 
 @dataclass
@@ -57,13 +68,13 @@ class StripeResult:
     expected_colour: str = ""
     expected_count: int = 0
     count: int = 0                  # stripes of the expected colour found
-    seen: str = ""                  # what the box actually holds, e.g. "red x3"
+    seen: str = ""                  # what the frame actually holds, e.g. "red x3"
     processing_time_ms: int = 0
     error: Optional[str] = None
     # Diagnostics for the settings page: where the stripes were, and the
     # frame that was judged.
     stripe_boxes: List[np.ndarray] = field(default_factory=list)
-    search_box: Optional[Tuple[int, int, int, int]] = None
+    found_box: Optional[Tuple[int, int, int, int]] = None    # round the group judged
     frame: Optional[np.ndarray] = None
 
 
@@ -104,12 +115,15 @@ def _paint_mask(masks: dict) -> np.ndarray:
 
 # ── Bands ───────────────────────────────────────────────────────────────────
 
-def _bands(mask: np.ndarray, min_area: int = 12) -> list:
+def _bands(mask: np.ndarray, min_area: int = 12, max_extent: float = 0.0) -> list:
     """Solid colour patches: their pixels, centre and size across/along.
 
     Patches touching the edge of the mask are left out. Stripes sit inside
-    the box drawn round them; a patch running off its edge is background,
-    such as a green mat behind green stripes.
+    the box drawn round them, or well inside the frame; a patch running off
+    its edge is background, such as a green mat behind green stripes.
+    With `max_extent`, patches whose bounding box is longer than that are
+    skipped before they are measured, which keeps a whole frame of
+    background colour cheap to look through.
     """
     mh, mw = mask.shape[:2]
     n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
@@ -118,8 +132,10 @@ def _bands(mask: np.ndarray, min_area: int = 12) -> list:
         x, y, w, h, area = stats[i]
         if area < min_area or x == 0 or y == 0 or x + w >= mw or y + h >= mh:
             continue
-        ys, xs = np.nonzero(labels == i)
-        pts = np.column_stack([xs, ys]).astype(np.float32)
+        if max_extent and max(w, h) > max_extent:
+            continue
+        ys, xs = np.nonzero(labels[y:y + h, x:x + w] == i)
+        pts = np.column_stack([xs + x, ys + y]).astype(np.float32)
         (cx, cy), (w, h), ang = cv2.minAreaRect(pts)
         # A stripe is a filled band, not a hairline or a scattered smear
         if area / max(1.0, w * h) < 0.45:
@@ -285,12 +301,12 @@ def _crop(frame: np.ndarray, roi: dict, margin: float) -> Tuple[np.ndarray, Tupl
     return frame[y0:y1, x0:x1], (x0, y0, x1 - x0, y1 - y0)
 
 
-def _colour_bands(masks: dict, colour: str) -> list:
+def _colour_bands(masks: dict, colour: str, max_extent: float = 0.0) -> list:
     """Bands of one colour. White ones lying on coloured paint are its shine."""
     mask = masks[colour]
     if colour == "white":
         mask = cv2.bitwise_and(mask, cv2.bitwise_not(_paint_mask(masks)))
-    return _bands(mask)
+    return _bands(mask, max_extent=max_extent)
 
 
 def dominant_colour(patch: np.ndarray) -> Tuple[Optional[str], int]:
@@ -365,11 +381,13 @@ def read_stripes(frame: np.ndarray, roi: dict, colour: Optional[str] = None,
         "count": count,
         "axis": [float(axis[0]), float(axis[1])],
         "stripe_width": width,
-        "stripe_length": float(np.median([b["long"] for b in bands])),
+        "stripe_length": float(np.median(_stripe_lengths(
+            bands, axis, [r for r in runs if r[1] - r[0] > width * 0.35]))),
         "span": span,
         # Start of one stripe to the start of the next
         "pitch": (span - width) / (count - 1) if count > 1 and count == found else 0.0,
         "size_tolerance": SIZE_TOLERANCE,
+        "contrast": _contrast(cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).astype(np.float32), bands),
     }
     boxes = [b["box"] + np.array([x0, y0], np.float32) for b in bands]
     return model, boxes
@@ -394,19 +412,161 @@ def _within(value: float, taught: float, tolerance: float) -> bool:
     return taught > 0 and (1 - tolerance) <= value / taught <= 1 / (1 - tolerance)
 
 
-def _judge(patch: np.ndarray, masks: dict, colour: str, model: dict) -> Tuple[int, bool, list]:
-    """(count, matches the taught part, bands used) for one colour."""
+def _groups(bands: list, link: float) -> List[list]:
+    """Bands that lie close together, each list one candidate stripe group."""
+    n = len(bands)
+    parent = list(range(n))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cs = np.array([b["centre"] for b in bands])
+    for i in range(n):
+        d = np.linalg.norm(cs[i + 1:] - cs[i], axis=1)
+        for j in np.nonzero(d <= link)[0]:
+            parent[root(i)] = root(i + 1 + j)
+    groups = {}
+    for i in range(n):
+        groups.setdefault(root(i), []).append(bands[i])
+    return list(groups.values())
+
+
+def _axes(group: list, taught: np.ndarray) -> List[np.ndarray]:
+    """Directions the cable might run through a group.
+
+    The line through the stripes' centres is usually right, but a shine
+    streak that splits each stripe in two adds centres across the cable, and
+    a single stripe has no line at all. Across the biggest band, and the
+    direction taught, cover those cases.
+    """
+    biggest = max(group, key=lambda b: b["area"])
+    across = np.array([-biggest["dir"][1], biggest["dir"][0]])
+    axes = [_cable_axis(group), across, taught]
+    out = []
+    for a in axes:
+        a = a / np.linalg.norm(a)
+        if not any(abs(float(a @ b)) > 0.99 for b in out):
+            out.append(a)
+    return out
+
+
+def _stripe_lengths(group: list, axis: np.ndarray, runs: list) -> List[float]:
+    """How far each stripe reaches across the cable, from all of its paint.
+
+    Measured per stripe rather than per band, so a stripe that a shine streak
+    has split into two halves still measures its full length.
+    """
+    pts = np.vstack([b["pts"] for b in group])
+    t = pts @ axis
+    t = t - t.min()
+    across = pts @ np.array([-axis[1], axis[0]])
+    lengths = []
+    for s, e in runs:
+        a = across[(t >= s) & (t < e)]
+        if a.size:
+            lengths.append(float(np.percentile(a, 97) - np.percentile(a, 3) + 1))
+    return lengths
+
+
+def _contrast(lab: np.ndarray, group: list) -> float:
+    """How far the group's paint colour is from the colour just round it."""
+    mask = np.zeros(lab.shape[:2], np.uint8)
+    pts = np.vstack([b["pts"] for b in group]).astype(int)
+    mask[pts[:, 1], pts[:, 0]] = 255
+    kernel = np.ones((3, 3), np.uint8)
+    # Skip the blurred edge of the paint, then take a thin ring beyond it
+    edge = cv2.dilate(mask, kernel, iterations=2)
+    ring = cv2.dilate(mask, kernel, iterations=6) & ~edge
+    if not ring.any():
+        return 0.0
+    paint = np.median(lab[mask > 0], axis=0)
+    around = np.median(lab[ring > 0], axis=0)
+    return float(np.linalg.norm(paint - around))
+
+
+def _lines_up(group: list, axis: np.ndarray, model: dict) -> bool:
+    """True if a group is laid out like stripes painted round one cable.
+
+    Searching a whole frame turns up scatters of background bits, such as
+    marks on a bench or glare on metal, that happen to be the stripes' size
+    and number. Real stripes sit one after another on a line along the
+    cable, evenly spaced at the taught pitch.
+
+    Each stripe is judged by all of its paint together: a shine streak can
+    split one into halves either side of the line, but their middle is still
+    on it. A band's own shape says nothing about the cable's direction, as a
+    stripe can be wider along the cable than across it.
+    """
+    tol = model.get("size_tolerance", SIZE_TOLERANCE)
+    normal = np.array([-axis[1], axis[0]])
+    pts = np.vstack([b["pts"] for b in group])
+    t = pts @ axis
+    t = t - t.min()
+    across = pts @ normal
+    runs = [r for r in _runs(group, axis) if r[1] - r[0] > model["stripe_width"] * 0.35]
+    if not runs:
+        return False
+
+    # Each stripe's middle on one line along the cable
+    middles = [float(np.median(across[(t >= s) & (t < e)])) for s, e in runs]
+    if max(middles) - min(middles) > model["stripe_length"] * 0.5:
+        return False
+
+    # Each stripe reaches as far across the cable as the taught ones
+    if not all(_within(n, model["stripe_length"], tol)
+               for n in _stripe_lengths(group, axis, runs)):
+        return False
+
+    # Evenly spaced at the taught pitch
+    pitch = model.get("pitch", 0.0)
+    if pitch > 0 and len(runs) == model["count"]:
+        starts = [s for s, _ in runs]
+        if not all(_within(b - a, pitch, tol) for a, b in zip(starts, starts[1:])):
+            return False
+    return True
+
+
+def _judge(masks: dict, lab: np.ndarray, colour: str, model: dict) -> Tuple[int, bool, list]:
+    """(count, matches the taught part, bands of the group) for one colour.
+
+    Every group of bands the taught stripe size in the frame is counted; the
+    first that matches the taught count and length wins. With none matching,
+    the group whose count comes closest is reported.
+    """
     tol = model.get("size_tolerance", SIZE_TOLERANCE)
     length = model["stripe_length"]
-    bands = [b for b in _colour_bands(masks, colour) if _within(b["long"], length, tol)]
+    width = model["stripe_width"]
+    pitch = model.get("pitch", 0.0)
+    expected = model["count"]
+    # Anything bigger than the whole taught group can't be one of its stripes
+    extent = (max(model["span"], length) + width) * 2
+    # A band may be a whole stripe or a piece of one split by shine, so only
+    # bands too big for a stripe, or mere specks, are dropped here; each
+    # stripe's full length is checked once the group is put together
+    bands = [b for b in _colour_bands(masks, colour, max_extent=extent)
+             if length * (1 - tol) * 0.4 <= b["long"] <= length / (1 - tol)]
     if not bands:
         return 0, False, []
-    found, span = _count(_runs(bands, np.array(model["axis"])),
-                         model["stripe_width"], model.get("pitch", 0.0))
-    expected = model["count"]
-    # One stripe has no group length to compare; its size already matched
-    span_ok = expected == 1 or _within(span, model["span"], tol)
-    return found, found == expected and span_ok, bands
+
+    link = max(pitch, width, length * 0.5) * GROUP_LINK
+    min_contrast = max(MIN_CONTRAST, CONTRAST_SHARE * model.get("contrast", 0.0))
+    taught_axis = np.array(model["axis"])
+    best = None                     # (miss, -area, count, bands)
+    for group in _groups(bands, link):
+        for axis in _axes(group, taught_axis):
+            found, span = _count(_runs(group, axis), width, pitch)
+            # One stripe has no group length to compare; its size already matched
+            span_ok = expected == 1 or _within(span, model["span"], tol)
+            if (found == expected and span_ok and _lines_up(group, axis, model)
+                    and _contrast(lab, group) >= min_contrast):
+                return found, True, group
+            key = (abs(found - expected), -sum(b["area"] for b in group), found, group)
+            if best is None or key[:2] < best[:2]:
+                best = key
+    return best[2], False, best[3]
 
 
 def inspect(part_number: str, frame: Optional[np.ndarray] = None) -> StripeResult:
@@ -437,30 +597,33 @@ def inspect(part_number: str, frame: Optional[np.ndarray] = None) -> StripeResul
         return _error(f"Camera 2 gives {frame.shape[1]}x{frame.shape[0]} frames, "
                       f"but this part was taught at {fw}x{fh}. Re-teach it.")
 
-    patch, search = _crop(frame, model["roi"], SEARCH_MARGIN)
-    masks = colour_masks(patch)
+    masks = colour_masks(frame)
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
     colour, expected = model["colour"], model["count"]
-    count, ok, bands = _judge(patch, masks, colour, model)
+    count, ok, bands = _judge(masks, lab, colour, model)
 
     seen = f"{colour} x{count}" if count else "none"
+    if not ok and count == expected:
+        # The right number, but not laid out like the taught stripes
+        seen += " of the wrong size or spacing"
     if not ok:
         # Name what is there instead, so the operator sees "red x3", not just NG
         for other in COLOURS:
             if other == colour:
                 continue
-            n, other_ok, _ = _judge(patch, masks, other, model)
+            n, other_ok, _ = _judge(masks, lab, other, model)
             if n and (other_ok or not count):
                 seen = f"{other} x{n}"
                 if other_ok:
                     break
 
-    x0, y0 = search[0], search[1]
-    boxes = [b["box"] + np.array([x0, y0], np.float32) for b in bands]
+    boxes = [b["box"] for b in bands]
+    found_box = (cv2.boundingRect(np.vstack(boxes).astype(np.int32)) if boxes else None)
     elapsed = int((time.time() - start) * 1000)
     return StripeResult(
         ok=ok, judgement="OK" if ok else "NG", part_number=part_number,
         expected_colour=colour, expected_count=expected, count=count, seen=seen,
         processing_time_ms=elapsed,
         error=None if ok else f"Expected {colour} x{expected}, found {seen}",
-        stripe_boxes=boxes, search_box=search, frame=frame,
+        stripe_boxes=boxes, found_box=found_box, frame=frame,
     )
