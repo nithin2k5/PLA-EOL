@@ -336,7 +336,11 @@ class RoiView(tk.Canvas):
         "move": "fleur",
     }
 
-    def __init__(self, parent, on_change=None, editable=True, **kw):
+    MAX_ZOOM = 16.0
+    ZOOM_STEP = 1.25
+
+    def __init__(self, parent, on_change=None, editable=True, zoomable=False,
+                 on_zoom=None, **kw):
         super().__init__(parent, bg=VIEW_BG, highlightthickness=0,
                          bd=0, cursor="crosshair", **kw)
         self._on_change = on_change
@@ -350,6 +354,16 @@ class RoiView(tk.Canvas):
         self._hint = None
         self._accent = OK_GREEN
         self._locked_size = None    # (w, h) in image px, or None for free drawing
+        # Shapes drawn over the image, as point lists in image coordinates
+        self._outlines = []
+        self._outline_color = ui.ACCENT_FILL
+        # Zoom: 1 fits the whole image. `_centre` is the image point shown at
+        # the middle of the view, or None for the middle of the image.
+        self._zoomable = zoomable
+        self._on_zoom = on_zoom
+        self._zoom = 1.0
+        self._centre = None
+        self._pan = None
 
         self.bind("<Configure>", lambda e: self._redraw())
         self.bind("<ButtonPress-1>", self._on_press)
@@ -359,6 +373,14 @@ class RoiView(tk.Canvas):
         self.bind("<Leave>", lambda e: self.config(cursor="crosshair"))
         self.bind("<Delete>", self.clear_roi)
         self.bind("<Escape>", self.clear_roi)
+        if zoomable:
+            # Wheel zooms; the right or middle button drags the picture, so
+            # the left button stays free for drawing the box
+            self.bind("<MouseWheel>", self._on_wheel)
+            for button in (2, 3):
+                self.bind("<ButtonPress-%d>" % button, self._on_pan_start)
+                self.bind("<B%d-Motion>" % button, self._on_pan)
+                self.bind("<ButtonRelease-%d>" % button, self._on_pan_end)
 
     # -- public API ---------------------------------------------------------
 
@@ -370,7 +392,72 @@ class RoiView(tk.Canvas):
                 self._roi = None
             elif prev_shape and prev_shape != img.shape[:2]:
                 self._roi = None        # a box means nothing at a new resolution
+            if prev_shape != img.shape[:2]:
+                # The same zoom on a frame of the same size, so a live view
+                # stays where it was zoomed to
+                self._set_zoom(1.0, None)
         self._redraw()
+
+    # -- zoom ---------------------------------------------------------------
+
+    def get_zoom(self):
+        return self._zoom
+
+    def zoom_by(self, factor):
+        """Zoom about the middle of the view."""
+        if self._view is None:
+            return
+        self._zoom_at(factor, self.winfo_width() / 2, self.winfo_height() / 2)
+
+    def zoom_fit(self):
+        self._set_zoom(1.0, None)
+        self._redraw()
+
+    def _set_zoom(self, zoom, centre):
+        zoom = min(max(zoom, 1.0), self.MAX_ZOOM)
+        changed = abs(zoom - self._zoom) > 1e-6
+        self._zoom = zoom
+        self._centre = centre if zoom > 1.0 else None
+        if changed and self._on_zoom:
+            self._on_zoom(zoom)
+
+    def _zoom_at(self, factor, sx, sy):
+        """Zoom by `factor`, keeping the image point under (sx, sy) in place."""
+        s, ox, oy, _, _ = self._view
+        ix, iy = (sx - ox) / s, (sy - oy) / s
+        new = min(max(self._zoom * factor, 1.0), self.MAX_ZOOM)
+        s2 = s * new / self._zoom
+        # Put the centre where it keeps (ix, iy) under the pointer
+        cx = (self.winfo_width() / 2 - (sx - ix * s2)) / s2
+        cy = (self.winfo_height() / 2 - (sy - iy * s2)) / s2
+        self._set_zoom(new, (cx, cy))
+        self._redraw()
+
+    def _on_wheel(self, event):
+        if self._view is not None and self._drag is None:
+            self._zoom_at(self.ZOOM_STEP if event.delta > 0 else 1 / self.ZOOM_STEP,
+                          event.x, event.y)
+        return "break"      # the page's scroll area must not scroll as well
+
+    def _on_pan_start(self, event):
+        if self._view is None or self._zoom <= 1.0:
+            return
+        s, ox, oy, _, _ = self._view
+        self._pan = (event.x, event.y, ((self.winfo_width() / 2 - ox) / s,
+                                        (self.winfo_height() / 2 - oy) / s))
+        self.config(cursor="fleur")
+
+    def _on_pan(self, event):
+        if self._pan is None or self._view is None:
+            return
+        x0, y0, (cx, cy) = self._pan
+        s = self._view[0]
+        self._centre = (cx - (event.x - x0) / s, cy - (event.y - y0) / s)
+        self._redraw()
+
+    def _on_pan_end(self, event):
+        self._pan = None
+        self.config(cursor="crosshair" if self._editable else "arrow")
 
     def get_image(self):
         return self._image
@@ -392,6 +479,13 @@ class RoiView(tk.Canvas):
 
     def set_accent(self, color):
         self._accent = color
+        self._redraw()
+
+    def set_outlines(self, outlines, color=None):
+        """Draw these shapes over the image, as lines that stay thin at any zoom."""
+        self._outlines = [list(map(tuple, o)) for o in (outlines or [])]
+        if color:
+            self._outline_color = color
         self._redraw()
 
     def lock_size(self, wh):
@@ -435,9 +529,19 @@ class RoiView(tk.Canvas):
             self._view = None
             return
         ih, iw = self._image.shape[:2]
-        scale = min(cw / iw, ch / ih)
+        scale = min(cw / iw, ch / ih) * self._zoom
         dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
-        self._view = (scale, (cw - dw) // 2, (ch - dh) // 2, dw, dh)
+        if self._centre is None:
+            ox, oy = (cw - dw) // 2, (ch - dh) // 2
+        else:
+            # Centre on the chosen point, but never scroll past an edge of
+            # the image while it is bigger than the view
+            ox = cw / 2 - self._centre[0] * scale
+            oy = ch / 2 - self._centre[1] * scale
+            ox = (cw - dw) / 2 if dw <= cw else min(0, max(cw - dw, ox))
+            oy = (ch - dh) / 2 if dh <= ch else min(0, max(ch - dh, oy))
+            self._centre = ((cw / 2 - ox) / scale, (ch / 2 - oy) / scale)
+        self._view = (scale, ox, oy, dw, dh)
 
     def _to_screen(self, ix, iy):
         s, ox, oy, _, _ = self._view
@@ -469,9 +573,16 @@ class RoiView(tk.Canvas):
             return
 
         s, ox, oy, dw, dh = self._view
-        self._photo, _ = _to_photo(self._image, dw, dh)
-        self.create_image(ox, oy, image=self._photo, anchor="nw")
+        if self._zoom <= 1.0:
+            self._photo, _ = _to_photo(self._image, dw, dh)
+            self.create_image(ox, oy, image=self._photo, anchor="nw")
+        else:
+            self._draw_visible(s, ox, oy, cw, ch)
         self.create_rectangle(ox, oy, ox + dw, oy + dh, outline=LINE)
+
+        for shape in self._outlines:
+            pts = [c for x, y in shape for c in self._to_screen(x, y)]
+            self.create_polygon(*pts, outline=self._outline_color, fill="", width=2)
 
         if self._roi:
             self._draw_marker()
@@ -488,6 +599,28 @@ class RoiView(tk.Canvas):
             rid = self.create_rectangle(bx0 - 6, by0 - 2, bx1 + 6, by1 + 2,
                                         fill=PANEL, outline=LINE)
             self.tag_raise(tid, rid)
+
+    def _draw_visible(self, s, ox, oy, cw, ch):
+        """Draw just the part of the image the zoomed view shows.
+
+        Scaling the whole frame at 16x would build an image hundreds of
+        megapixels big on every redraw.
+        """
+        ih, iw = self._image.shape[:2]
+        x0 = max(0, int(-ox / s))
+        y0 = max(0, int(-oy / s))
+        x1 = min(iw, int((cw - ox) / s) + 2)
+        y1 = min(ih, int((ch - oy) / s) + 2)
+        if x1 <= x0 or y1 <= y0:
+            return
+        patch = self._image[y0:y1, x0:x1]
+        rgb = cv2.cvtColor(patch, cv2.COLOR_GRAY2RGB if patch.ndim == 2 else cv2.COLOR_BGR2RGB)
+        w, h = max(1, round((x1 - x0) * s)), max(1, round((y1 - y0) * s))
+        # Close in, show the real pixels rather than a blur, so a stripe's
+        # edge is where the camera saw it
+        resample = Image.Resampling.NEAREST if s >= 2 else Image.Resampling.BILINEAR
+        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((w, h), resample))
+        self.create_image(ox + x0 * s, oy + y0 * s, image=self._photo, anchor="nw")
 
     def _draw_marker(self):
         s, ox, oy, dw, dh = self._view
@@ -2455,15 +2588,6 @@ def _open_camera_dialog(parent, source=None, title="Inspection Camera"):
 # Stripe check (camera 2)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _with_outlines(img, outlines, color_hex):
-    """A copy of `img` with each stripe outline drawn on it."""
-    out = img.copy()
-    r, g, b = (int(color_hex[i:i + 2], 16) for i in (1, 3, 5))
-    thick = max(1, round(max(img.shape[:2]) / 400))
-    for o in outlines:
-        cv2.polylines(out, [np.round(o).astype(np.int32)], True, (b, g, r), thick)
-    return out
-
 
 def _open_stripe_teach(parent, part_number=None):
     """Teach or re-teach one part's stripes. Returns the saved part number, or None."""
@@ -2516,16 +2640,42 @@ def _open_stripe_teach(parent, part_number=None):
 
     view_wrap = tk.Frame(left, bg=LINE)
     view_wrap.grid(row=0, column=0, sticky="nsew")
-    view = RoiView(view_wrap, on_change=lambda r, final: _roi_changed(r, final))
+    # Zoomable: stripes are often only a few pixels wide in the frame, too
+    # small to box accurately at the size that fits the whole picture
+    view = RoiView(view_wrap, on_change=lambda r, final: _roi_changed(r, final),
+                   zoomable=True, on_zoom=lambda z: _paint_zoom())
     view.pack(fill="both", expand=True, padx=1, pady=1)
 
     view_bar = tk.Frame(left, bg=BG)
     view_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-    frame_lbl = tk.Label(view_bar, text="", bg=BG, fg=TXT_DIM, font=(MONO, 11))
-    frame_lbl.pack(side="right")
     btn_capture = _btn(view_bar, "Capture Frame", BTN_SUCCESS, icon="camera")
     btn_live = _btn(view_bar, "Live View", BTN_NEUTRAL, icon="play")
     btn_import = _btn(view_bar, "Import Image…", BTN_NEUTRAL, icon="document")
+
+    zoom_bar = tk.Frame(left, bg=BG)
+    zoom_bar.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+    tk.Label(zoom_bar, text="Zoom", bg=BG, fg=TXT_DIM, font=(FONT, 11)).pack(side="left")
+    btn_zoom_out = _btn(zoom_bar, "−", BTN_NEUTRAL, width=34, pady=2,
+                        command=lambda: view.zoom_by(1 / RoiView.ZOOM_STEP))
+    btn_zoom_out.pack(side="left", padx=(8, 0))
+    zoom_lbl = tk.Label(zoom_bar, text="1.0×", bg=BG, fg=TXT, width=6,
+                        font=(MONO, 11, "bold"))
+    zoom_lbl.pack(side="left", padx=4)
+    btn_zoom_in = _btn(zoom_bar, "+", BTN_NEUTRAL, width=34, pady=2,
+                       command=lambda: view.zoom_by(RoiView.ZOOM_STEP))
+    btn_zoom_in.pack(side="left")
+    btn_zoom_fit = _btn(zoom_bar, "Fit", BTN_NEUTRAL, pady=2, command=lambda: view.zoom_fit())
+    btn_zoom_fit.pack(side="left", padx=(8, 0))
+    frame_lbl = tk.Label(zoom_bar, text="", bg=BG, fg=TXT_DIM, font=(MONO, 11))
+    frame_lbl.pack(side="right")
+
+    def _paint_zoom():
+        z = view.get_zoom()
+        # Relative to the whole picture fitted in the view, not camera pixels
+        zoom_lbl.config(text="%.1f×" % z)
+        _set_btn_enabled(btn_zoom_out, z > 1.0)
+        _set_btn_enabled(btn_zoom_in, z < RoiView.MAX_ZOOM)
+        _set_btn_enabled(btn_zoom_fit, z > 1.0)
 
     # ── Right: steps ───────────────────────────────────────────────────────
     # Scrolls, so the colour and count stay reachable on a short screen
@@ -2560,7 +2710,7 @@ def _open_stripe_teach(parent, part_number=None):
     _note(s2, "Put a good part in the fixture and capture it, or import a photo "
               "taken by camera 2.")
     frame_note = tk.Label(s2, text="", bg=BG, fg=TXT_DIM, font=(FONT, 11, "bold"),
-                          anchor="w")
+                          anchor="w", justify="left", wraplength=270)
     frame_note.pack(fill="x", pady=(4, 0))
 
     s3, b3 = _step(rail, 3, "Stripe box")
@@ -2629,10 +2779,8 @@ def _open_stripe_teach(parent, part_number=None):
         """The taught frame, with the stripes that were found outlined."""
         if state["frame"] is None:
             return
-        img = state["frame"]
-        if state["outlines"]:
-            img = _with_outlines(img, state["outlines"], ui.ACCENT_FILL)
-        view.set_image(img)
+        view.set_image(state["frame"])
+        view.set_outlines(state["outlines"])
 
     def _analyse():
         """Read the stripes inside the box, as saving would."""
@@ -2690,10 +2838,11 @@ def _open_stripe_teach(parent, part_number=None):
         if live["on"]:
             view.set_editable(False)
             view.set_hint("Live view — capture a frame to draw the box")
+            view.set_outlines([])      # they belong to the captured frame
             frame_lbl.config(text="LIVE  ·  camera %d" % cam["index"])
         else:
             view.set_editable(True)
-            view.set_hint("Drag to box the stripes")
+            view.set_hint("Drag to box the stripes  ·  scroll to zoom, right-drag to move")
         _paint_buttons()
 
     def _paint_buttons():
@@ -2719,8 +2868,9 @@ def _open_stripe_teach(parent, part_number=None):
             roi = previous["roi"]
         view.set_roi(roi, notify=False)
         _set_live(False)
-        frame_lbl.config(text="%s  ·  %d x %d" % (label, img.shape[1], img.shape[0]))
-        frame_note.config(text="Captured (%s)" % label, fg=OK_GREEN)
+        short = label if len(label) <= 24 else label[:21] + "…"
+        frame_lbl.config(text="%s  ·  %d x %d" % (short, img.shape[1], img.shape[0]))
+        frame_note.config(text="Captured (%s)" % short, fg=OK_GREEN)
         _roi_changed(view.get_roi())
 
     def _capture():
@@ -2826,6 +2976,7 @@ def _open_stripe_teach(parent, part_number=None):
             pass
 
     _paint_buttons()
+    _paint_zoom()
     _refresh_gates()
     _tick()
 
@@ -2959,7 +3110,8 @@ def _open_stripe_test(parent, part_number):
         m_time.config(text="%d ms" % result.processing_time_ms, fg=TXT)
 
         if result.frame is not None:
-            view.set_image(_with_outlines(result.frame, result.stripe_boxes, ui.ACCENT_FILL))
+            view.set_image(result.frame)
+            view.set_outlines(result.stripe_boxes)
             view.set_accent(color)
             if result.search_box:
                 x, y, bw, bh = result.search_box
