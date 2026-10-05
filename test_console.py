@@ -876,7 +876,7 @@ class EOLTesterGUI:
         """Create the lot tree with specified columns"""
         # Starting widths; every column stretches to fill the grid, so all
         # eight readings still fit on a narrow screen
-        column_widths = {"Sl.No": 45, "LOT NUMBER": 100, "CAM1": 55,
+        column_widths = {"Sl.No": 45, "LOT NUMBER": 100, "CAM1": 55, "CAM2": 55,
                          "RESULT": 60, "SCAN RESULT": 90}
 
         self.tree = ttk.Treeview(parent_frame,
@@ -929,7 +929,7 @@ class EOLTesterGUI:
                 + [d for d in ("L2", "L3", "L4") if d in devices]
                 + ["P1", "P2"]
                 + [d for d in ("P3", "P4") if d in devices]
-                + ["CAM1", "RESULT", "SCAN RESULT"])
+                + ["CAM1", "CAM2", "RESULT", "SCAN RESULT"])
 
     def update_tree_columns(self, devices=None):
         """Rebuild the results grid for the devices this part reports.
@@ -3722,14 +3722,14 @@ class EOLTesterGUI:
             base_columns = [
                 'TD_MACHINE_ID', 'TD_PART_NUMBER', 'TD_LOT_NUMBER', 
                 'TD_TRACEABILITY_CODE', 'TD_RECORD_DATE', 'TD_DATETIME', 
-                'L1', 'P1', 'P2', 'CAM1', 'TD_OVERALL_STATUS', 'TD_EMP_CODE'
+                'L1', 'P1', 'P2', 'CAM1', 'CAM2', 'TD_OVERALL_STATUS', 'TD_EMP_CODE'
             ]
-            
+
             base_values = [
                 self.machineID, self.partNumber, self.lotNo,
                 self.traceabilityCode, datetime.today().date(), datetime.now(),
                 self.L1MaxValue, self.P01Value, self.P02Value,
-                self.cam1Result, status, self.current_employee_id
+                self.cam1Result, self.cam2Result, status, self.current_employee_id
             ]
             
             # Add optional columns based on part configuration
@@ -3768,11 +3768,12 @@ class EOLTesterGUI:
             cursor.execute("""
                 INSERT INTO TBL_TEST_RESULTS
                 (LOT_NUMBER, PART_NUMBER, L1, L2, L3, L4, P1, P2, P3, P4,
-                 RESULT, CREATED_BY, EMP_CODE, SPEC_DATA)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 CAM2, RESULT, CREATED_BY, EMP_CODE, SPEC_DATA)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 self.lotNo, self.partNumber,
                 *(measured.get(d) for d in devices),
+                self.cam2Result,
                 "PASS" if status == "OK" else "NG",
                 self.current_employee_id, self.current_employee_id,
                 json.dumps({d: measured[d] for d in devices if d in measured}),

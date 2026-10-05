@@ -26,12 +26,17 @@ COLUMNS = (
     ("P2", 80, False),
     ("P3", 80, False),
     ("P4", 80, False),
+    ("CAM2", 80, False),
     ("RESULT", 90, False),
     ("SCAN RESULT", 125, False),
     ("EMPLOYEE CODE", 165, False),
     ("SPEC DATA", 240, True),
     ("CREATED DATE", 185, False),
 )
+
+# Where the result sits in a fetched row. The query selects the ID first, in
+# the place the NO column takes, so a row lines up with COLUMNS.
+RESULT_AT = [heading for heading, _, _ in COLUMNS].index("RESULT")
 
 # Shown in a cell with no value, rather than Python's "None".
 BLANK = "—"
@@ -288,7 +293,7 @@ class DataConsole:
             query = """
                 SELECT
                     ID, LOT_NUMBER, PART_NUMBER, L1, L2, L3, L4, P1, P2, P3, P4,
-                    RESULT, SCAN_RESULT, EMP_CODE, SPEC_DATA, CREATED_DATE
+                    CAM2, RESULT, SCAN_RESULT, EMP_CODE, SPEC_DATA, CREATED_DATE
                 FROM TBL_TEST_RESULTS
                 WHERE DATE(CREATED_DATE) BETWEEN %s AND %s
             """
@@ -326,7 +331,7 @@ class DataConsole:
             raw = [i] + list(record)[1:]  # Add row number, skip ID
             self.export_rows.append(raw)
             tags = ['band' if ((i - 1) // 5) % 2 == 0 else 'plain']
-            if str(record[11]).upper() == 'NG':
+            if str(record[RESULT_AT]).upper() == 'NG':
                 tags.append('ng')
             self.result_table.insert('', 'end', values=[self.display(v) for v in raw],
                                      tags=tuple(tags))
@@ -344,8 +349,8 @@ class DataConsole:
 
     def show_summary(self, records):
         total = len(records)
-        passed = sum(1 for r in records if str(r[11]).upper() == 'PASS')
-        failed = sum(1 for r in records if str(r[11]).upper() == 'NG')
+        passed = sum(1 for r in records if str(r[RESULT_AT]).upper() == 'PASS')
+        failed = sum(1 for r in records if str(r[RESULT_AT]).upper() == 'NG')
         self.stats['total'].configure(text=str(total))
         self.stats['pass'].configure(text=str(passed))
         self.stats['ng'].configure(text=str(failed))

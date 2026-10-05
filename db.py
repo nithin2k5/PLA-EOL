@@ -12,7 +12,8 @@ Typical use:
     cursor = conn.cursor()
 
 Call init_database() once at start-up to create the database and any
-missing tables. Existing tables are never altered.
+missing tables. Existing tables are only altered to add the columns listed
+in ADDED_COLUMNS.
 """
 
 import mysql.connector
@@ -134,6 +135,7 @@ SCHEMA = [
             P2 DECIMAL(10,3),
             P3 DECIMAL(10,3),
             P4 DECIMAL(10,3),
+            CAM2 VARCHAR(20),
             RESULT VARCHAR(10),
             SCAN_RESULT VARCHAR(10),
             CREATED_BY VARCHAR(50),
@@ -161,6 +163,7 @@ SCHEMA = [
             P3 DECIMAL(10,3),
             P4 DECIMAL(10,3),
             CAM1 VARCHAR(20),
+            CAM2 VARCHAR(20),
             TD_OVERALL_STATUS VARCHAR(10),
             TD_EMP_CODE VARCHAR(50),
             TD_BARCODE_SCAN_RESULT VARCHAR(10),
@@ -210,6 +213,26 @@ SCHEMA = [
 ]
 
 
+# Columns added to a table after it was first created. CREATE TABLE IF NOT
+# EXISTS leaves an existing table as it is, so init_database adds these to
+# databases made before them: (table, column, definition).
+ADDED_COLUMNS = [
+    ("TBL_TEST_DATA", "CAM2", "VARCHAR(20) AFTER CAM1"),
+    ("TBL_TEST_RESULTS", "CAM2", "VARCHAR(20) AFTER P4"),
+]
+
+
+def add_missing_columns(cursor):
+    """Add any of ADDED_COLUMNS that an existing table is missing."""
+    for table, column, definition in ADDED_COLUMNS:
+        cursor.execute(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (DATABASE, table, column))
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}")
+
+
 def ensure_database():
     """Create the schema's database if the server does not have it yet."""
     conn = connect_server()
@@ -231,6 +254,7 @@ def init_database(raise_on_error=False):
             cursor = conn.cursor()
             for name, statement in SCHEMA:
                 cursor.execute(statement)
+            add_missing_columns(cursor)
             conn.commit()
             cursor.close()
         finally:
