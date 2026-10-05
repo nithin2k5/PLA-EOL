@@ -30,6 +30,17 @@ MAX_SIDE = 800
 _VERDICT_BGR = {"PASS": (0, 160, 0), "NG": (0, 0, 220), "ERROR": (0, 140, 255)}
 
 
+def outlined(frame: np.ndarray, outlines: Optional[List[np.ndarray]],
+             verdict: str) -> np.ndarray:
+    """A copy of `frame` with the shapes drawn in the verdict's colour."""
+    img = frame.copy()
+    colour = _VERDICT_BGR.get(verdict, (90, 90, 90))
+    thick = max(2, round(max(img.shape[:2]) / 300))
+    for shape in outlines or []:
+        cv2.polylines(img, [np.round(shape).astype(np.int32)], True, colour, thick)
+    return img
+
+
 def save(frame: np.ndarray, camera_name: str, part_number: str, verdict: str,
          detail: str = "", outlines: Optional[List[np.ndarray]] = None) -> Optional[str]:
     """Store one camera's picture of a test. Returns its relative path.
@@ -39,11 +50,8 @@ def save(frame: np.ndarray, camera_name: str, part_number: str, verdict: str,
     failed for want of its picture.
     """
     try:
-        img = frame.copy()
+        img = outlined(frame, outlines, verdict)
         colour = _VERDICT_BGR.get(verdict, (90, 90, 90))
-        thick = max(2, round(max(img.shape[:2]) / 300))
-        for shape in outlines or []:
-            cv2.polylines(img, [np.round(shape).astype(np.int32)], True, colour, thick)
 
         scale = min(1.0, MAX_SIDE / max(img.shape[:2]))
         if scale < 1.0:

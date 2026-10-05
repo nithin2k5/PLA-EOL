@@ -89,6 +89,74 @@ def send_raw_to_printer(printer_name, data):
         winspool.ClosePrinter(handle)
 
 
+class LiveCameraView(tk.Frame):
+    """One camera's live picture, with its verdict in a strip underneath.
+
+    While a part is tested the view shows the camera's stream. Once a check
+    has judged a frame, hold() keeps that frame on screen until resume(), so
+    the operator can see what was judged and why.
+    """
+
+    REFRESH_MS = 80
+
+    def __init__(self, parent, height, font, idle_fill):
+        super().__init__(parent, bg='black')
+        box = tk.Frame(self, bg='black', height=height)
+        box.pack(fill="x")
+        box.pack_propagate(False)
+        self.picture = tk.Label(box, bg='black', fg='#A0A0A0', font=(font, 11, 'bold'))
+        self.picture.pack(fill="both", expand=True)
+        self.strip = tk.Label(self, text="STATUS", bg=idle_fill, fg='black',
+                              font=(font, 14, 'bold'))
+        self.strip.pack(fill="x")
+        self.stream = None
+        self.held = None
+        self.photo = None
+        self.note = "Camera not set up"
+        self.after(self.REFRESH_MS, self.refresh)
+
+    def set_status(self, text, fill):
+        self.strip.configure(text=text, bg=fill)
+
+    def set_stream(self, stream, note="Camera not set up"):
+        """Show this camera stream; with None, show `note` instead."""
+        self.stream = stream
+        self.note = note
+
+    def hold(self, frame):
+        """Keep showing `frame`, the one a check judged, until resume()."""
+        if frame is not None:
+            self.held = frame
+            self.show(frame)
+
+    def resume(self):
+        self.held = None
+
+    def refresh(self):
+        if not self.winfo_exists():
+            return
+        if self.held is None:
+            frame = self.stream.latest() if self.stream is not None else None
+            if frame is not None:
+                self.show(frame)
+            elif self.stream is None or not self.stream.is_alive():
+                self.photo = None
+                self.picture.configure(
+                    image="", text=self.note if self.stream is None else "Camera not responding")
+        self.after(self.REFRESH_MS, self.refresh)
+
+    def show(self, frame):
+        """Fit a BGR frame into the box, keeping its shape."""
+        w, h = self.picture.winfo_width(), self.picture.winfo_height()
+        if w < 10 or h < 10:
+            return
+        scale = min(w / frame.shape[1], h / frame.shape[0])
+        size = (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale)))
+        rgb = Image.fromarray(frame[..., ::-1].copy())     # BGR to RGB
+        self.photo = ImageTk.PhotoImage(rgb.resize(size, Image.Resampling.BILINEAR))
+        self.picture.configure(image=self.photo, text="")
+
+
 class FooterMessage(tk.Label):
     """The machine status line in the footer.
 
@@ -434,7 +502,7 @@ class EOLTesterGUI:
         self.cam2Result = ""
         self.cam1Image = None       # pictures of this test, relative paths
         self.cam2Image = None
-        self.camera_streams = []
+        self.camera_streams = {}    # by camera source, e.g. "cam2"
         self.resetPLCOnFormClosing = False
         self.machineOnPLCCoilAddress = ""
         self.alertOnPLCCoilAddress = ""
@@ -507,6 +575,8 @@ class EOLTesterGUI:
     LABEL_COUNT = 16            # labels L1-L16, as Model Settings offers
     IMAGE_WIDTH = 750           # the canvas Model Settings places labels on
     IMAGE_HEIGHT = 450
+    # Height of each camera's live picture, at full screen scale
+    LIVE_HEIGHT = 190
     # Screen height taken by everything but the part image: title, footer,
     # part header, label row, lamps, window chrome, and the least the charts
     # and results grid below can work with.
@@ -717,9 +787,8 @@ class EOLTesterGUI:
         # Cameras first, packed to the bottom, so the grid takes the rest
         cameras = tk.Frame(panel, bg=self.PANEL)
         cameras.pack(fill="x", side="bottom", pady=(4, 0))
-        cameras.grid_columnconfigure(0, weight=1, uniform='camera')
-        cameras.grid_columnconfigure(1, weight=1, uniform='camera')
-        cameras.grid_columnconfigure(2, weight=2, uniform='camera')
+        for column in range(3):
+            cameras.grid_columnconfigure(column, weight=1, uniform='camera')
 
         def group(column, title):
             box = tk.LabelFrame(cameras, text=title, bg=self.PANEL, fg='black',
@@ -727,16 +796,14 @@ class EOLTesterGUI:
             box.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0))
             return box
 
-        self.cam1_status = tk.Label(group(0, "CAMERA 1"), text="CAMERA ONE\nSTATUS",
-                                    bg=self.SKY, fg='black', height=2,
-                                    font=(self.FONT, 15, 'bold'))
-        self.cam1_status.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-
-        # Camera 2 is judged by the app itself: the stripes on the cable
-        self.cam2_status = tk.Label(group(1, "CAMERA 2"), text="CAMERA TWO\nSTATUS",
-                                    bg=self.SKY, fg='black', height=2,
-                                    font=(self.FONT, 15, 'bold'))
-        self.cam2_status.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        # Each camera live, its verdict underneath. Camera 1 looks for
+        # missing parts (its verdict comes from the PLC); camera 2 checks the
+        # stripes on the cable, judged by the app itself.
+        live_height = round(self.LIVE_HEIGHT * self.image_scale)
+        self.cam1_view = LiveCameraView(group(0, "CAMERA 1"), live_height, self.FONT, self.SKY)
+        self.cam1_view.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.cam2_view = LiveCameraView(group(1, "CAMERA 2"), live_height, self.FONT, self.SKY)
+        self.cam2_view.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # Where the printed label gets scanned back in. It only opens while a
         # freshly printed label is waiting to be checked.
@@ -747,7 +814,8 @@ class EOLTesterGUI:
                                          insertbackground='black',
                                          font=(self.FONT, 11, 'bold'), justify="center",
                                          relief="sunken", bd=1)
-        self.label_scan_entry.pack(fill="both", expand=True, padx=6, pady=(0, 6), ipady=16)
+        # Its usual height, in the middle of the box the camera views make tall
+        self.label_scan_entry.pack(fill="x", expand=True, padx=6, pady=(0, 6), ipady=16)
         self.label_scan_entry.insert(0, self.SCAN_PLACEHOLDER)
         self.label_scan_entry.configure(state='disabled')
         self.label_scan_entry.bind("<Return>", self.submit_label_scan)
@@ -1182,20 +1250,20 @@ class EOLTesterGUI:
         cam_on = status_values.get(self.process_addresses[10], False)
 
         if not cam_on:
-            text, fill = "CAMERA ONE\nOFF", self.SILVER
+            text, fill = "OFF", self.SILVER
             self.cam1Result = "OFF"
         elif cam_ok and cam_ng:
-            text, fill = "CAMERA ONE\nERROR", '#FFA500'
+            text, fill = "ERROR", '#FFA500'
         elif cam_ok:
-            text, fill = "CAMERA ONE\nPASS", '#00FF00'
+            text, fill = "PASS", '#00FF00'
             self.cam1Result = "PASS"
         elif cam_ng:
-            text, fill = "CAMERA ONE\nNG", '#FF0000'
+            text, fill = "NG", '#FF0000'
             self.cam1Result = "NG"
         else:
-            text, fill = "CAMERA ONE\nON", self.SKY
+            text, fill = "ON", self.SKY
 
-        self.cam1_status.configure(text=text, bg=fill)
+        self.cam1_view.set_status(text, fill)
 
     def connect_to_devices(self):
         """Report the console ready once its window is built."""
@@ -1217,11 +1285,16 @@ class EOLTesterGUI:
         too.
         """
         if stripe_check is None:
+            for view in (self.cam1_view, self.cam2_view):
+                view.set_stream(None, "Camera support not installed")
             return
-        for source in (self.camera1_source(), stripe_check.CAMERA_SOURCE):
+        for source, view in ((self.camera1_source(), self.cam1_view),
+                             (stripe_check.CAMERA_SOURCE, self.cam2_view)):
             index, width, height = load_camera_config(source)
             if index >= 0:
-                self.camera_streams.append(camera.acquire(index, width, height))
+                self.camera_streams[source] = camera.acquire(index, width, height)
+            view.set_stream(self.camera_streams.get(source),
+                            "Camera not set up\n\nChoose it in Vision Settings")
         threading.Thread(target=captures.remove_old, daemon=True).start()
 
     def grab_camera1(self):
@@ -1233,8 +1306,7 @@ class EOLTesterGUI:
         """Show camera 2's verdict: PASS, NG, ERROR, OFF or CHECKING."""
         fills = {"PASS": '#00FF00', "NG": '#FF0000', "ERROR": '#FFA500',
                  "OFF": self.SILVER, "CHECKING": self.SKY}
-        self.cam2_status.configure(text="CAMERA TWO\n" + result,
-                                   bg=fills.get(result, self.SKY))
+        self.cam2_view.set_status(result, fills.get(result, self.SKY))
 
     def run_camera_checks(self, then):
         """Check the stripes on camera 2 and keep both cameras' pictures.
@@ -1260,6 +1332,7 @@ class EOLTesterGUI:
             try:
                 frame = self.grab_camera1()
                 if frame is not None:
+                    out["cam1_frame"] = frame
                     out["cam1_image"] = captures.save(frame, "CAM1", part_number, cam1_verdict)
             except Exception as e:
                 print(f"[CAM1] no picture: {e}")
@@ -1270,12 +1343,15 @@ class EOLTesterGUI:
                     verdict = ("PASS" if result.ok else
                                "NG" if result.judgement == "NG" else "ERROR")
                     if result.frame is not None:
+                        out["cam2_frame"] = captures.outlined(
+                            result.frame, result.stripe_boxes, verdict)
                         out["cam2_image"] = captures.save(
                             result.frame, "CAM2", part_number, verdict,
                             result.seen, result.stripe_boxes)
                 else:
                     frame = stripe_check.capture_frame()
                     if frame is not None:
+                        out["cam2_frame"] = frame
                         out["cam2_image"] = captures.save(frame, "CAM2", part_number, "OFF")
             except Exception as e:
                 out["error"] = str(e)
@@ -1289,6 +1365,9 @@ class EOLTesterGUI:
                 return
             self.cam1Image = out.get("cam1_image")
             self.cam2Image = out.get("cam2_image")
+            # Hold what was judged on screen until the next part
+            self.cam1_view.hold(out.get("cam1_frame"))
+            self.cam2_view.hold(out.get("cam2_frame"))
             result = out.get("result")
             if not checking:
                 self.cam2Result = "OFF"
@@ -2171,9 +2250,9 @@ class EOLTesterGUI:
             # Stop all blinking labels
             self.stop_all_label_blinking()
 
-            for stream in self.camera_streams:
+            for stream in self.camera_streams.values():
                 stream.release()
-            self.camera_streams = []
+            self.camera_streams = {}
             
             # Clean up loadcell connections
             if hasattr(self, 'loadcell1_client') and self.loadcell1_client:
@@ -3725,12 +3804,14 @@ class EOLTesterGUI:
         # Reset flags
         self.rcvdTestRslt = False
         self.cam1Result = ""
-        if hasattr(self, 'cam1_status'):
-            self.cam1_status.configure(text="CAMERA ONE\nSTATUS", bg=self.SKY)
+        if hasattr(self, 'cam1_view'):
+            self.cam1_view.set_status("STATUS", self.SKY)
+            self.cam1_view.resume()
         self.cam2Result = ""
         self.cam1Image = self.cam2Image = None
-        if hasattr(self, 'cam2_status'):
-            self.cam2_status.configure(text="CAMERA TWO\nSTATUS", bg=self.SKY)
+        if hasattr(self, 'cam2_view'):
+            self.cam2_view.set_status("STATUS", self.SKY)
+            self.cam2_view.resume()
 
     def reset_measurements(self):
         """Zero the readings so the next test's peaks start from nothing."""
