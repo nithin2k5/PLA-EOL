@@ -104,10 +104,10 @@ class LiveCameraView(tk.Frame):
         box = tk.Frame(self, bg='black', height=height)
         box.pack(fill="x")
         box.pack_propagate(False)
-        self.picture = tk.Label(box, bg='black', fg='#A0A0A0', font=(font, 11, 'bold'))
+        self.picture = tk.Label(box, bg='black', fg='#A0A0A0', font=(font, 10, 'bold'))
         self.picture.pack(fill="both", expand=True)
         self.strip = tk.Label(self, text="STATUS", bg=idle_fill, fg='black',
-                              font=(font, 14, 'bold'))
+                              font=(font, 12, 'bold'))
         self.strip.pack(fill="x")
         self.stream = None
         self.held = None
@@ -576,7 +576,7 @@ class EOLTesterGUI:
     IMAGE_WIDTH = 750           # the canvas Model Settings places labels on
     IMAGE_HEIGHT = 450
     # Height of each camera's live picture, at full screen scale
-    LIVE_HEIGHT = 190
+    LIVE_HEIGHT = 120
     # Screen height taken by everything but the part image: title, footer,
     # part header, label row, lamps, window chrome, and the least the charts
     # and results grid below can work with.
@@ -787,8 +787,9 @@ class EOLTesterGUI:
         # Cameras first, packed to the bottom, so the grid takes the rest
         cameras = tk.Frame(panel, bg=self.PANEL)
         cameras.pack(fill="x", side="bottom", pady=(4, 0))
-        for column in range(3):
-            cameras.grid_columnconfigure(column, weight=1, uniform='camera')
+        cameras.grid_columnconfigure(0, weight=1, uniform='camera')
+        cameras.grid_columnconfigure(1, weight=1, uniform='camera')
+        cameras.grid_columnconfigure(2, weight=2, uniform='camera')
 
         def group(column, title):
             box = tk.LabelFrame(cameras, text=title, bg=self.PANEL, fg='black',
@@ -1294,7 +1295,7 @@ class EOLTesterGUI:
             if index >= 0:
                 self.camera_streams[source] = camera.acquire(index, width, height)
             view.set_stream(self.camera_streams.get(source),
-                            "Camera not set up\n\nChoose it in Vision Settings")
+                            "Not set up\n(Vision Settings)")
         threading.Thread(target=captures.remove_old, daemon=True).start()
 
     def grab_camera1(self):
