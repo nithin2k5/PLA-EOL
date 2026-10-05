@@ -20,12 +20,14 @@ import db
 import ui
 from plc_address import bit_address
 
-# Camera 2 checks the stripes on the cable. Without OpenCV the console still
-# runs, and camera 2 shows OFF.
+# Camera 2 checks the stripes on the cable, and both cameras' pictures are
+# kept with each test. Without OpenCV the console still runs, camera 2 shows
+# OFF and no pictures are kept.
 try:
-    from vision_engine import camera, stripe_check
+    from vision_engine import camera, captures, stripe_check
+    from vision_engine import load_camera_config, load_vision_config
 except ImportError:
-    camera = stripe_check = None
+    camera = captures = stripe_check = None
 
 
 class SerializedModbusClient:
@@ -430,7 +432,9 @@ class EOLTesterGUI:
         # Camera and Alert Variables
         self.cam1Result = ""
         self.cam2Result = ""
-        self.cam2_stream = None
+        self.cam1Image = None       # pictures of this test, relative paths
+        self.cam2Image = None
+        self.camera_streams = []
         self.resetPLCOnFormClosing = False
         self.machineOnPLCCoilAddress = ""
         self.alertOnPLCCoilAddress = ""
@@ -1195,21 +1199,35 @@ class EOLTesterGUI:
 
     def connect_to_devices(self):
         """Report the console ready once its window is built."""
-        self.open_camera2()
+        self.open_cameras()
         self.safe_update_message("System ready.", "green")
 
-    def open_camera2(self):
-        """Keep camera 2 streaming while the console is open.
+    @staticmethod
+    def camera1_source():
+        """Camera 1 is the camera Vision Settings sets up for inspection."""
+        return load_vision_config().get("camera_source", "cam1")
+
+    def open_cameras(self):
+        """Keep the USB cameras streaming while the console is open.
 
         A camera opened cold needs about a second for its exposure to settle.
-        Holding the stream open means each stripe check judges a settled frame
-        straight away instead of adding that wait to every cycle.
+        Holding the streams open means each test's pictures, and the stripe
+        check, use a settled frame straight away instead of adding that wait
+        to every cycle. Pictures past their keeping time are cleared out here
+        too.
         """
         if stripe_check is None:
             return
-        index, width, height = stripe_check.camera_settings()
-        if index >= 0:
-            self.cam2_stream = camera.acquire(index, width, height)
+        for source in (self.camera1_source(), stripe_check.CAMERA_SOURCE):
+            index, width, height = load_camera_config(source)
+            if index >= 0:
+                self.camera_streams.append(camera.acquire(index, width, height))
+        threading.Thread(target=captures.remove_old, daemon=True).start()
+
+    def grab_camera1(self):
+        """A frame from camera 1, or None if it isn't a USB camera set up here."""
+        index, width, height = load_camera_config(self.camera1_source())
+        return camera.grab(index, width, height) if index >= 0 else None
 
     def update_cam2_status(self, result):
         """Show camera 2's verdict: PASS, NG, ERROR, OFF or CHECKING."""
@@ -1218,27 +1236,47 @@ class EOLTesterGUI:
         self.cam2_status.configure(text="CAMERA TWO\n" + result,
                                    bg=fills.get(result, self.SKY))
 
-    def run_stripe_check(self, then):
-        """Check the part's stripes on camera 2, then call `then`.
+    def run_camera_checks(self, then):
+        """Check the stripes on camera 2 and keep both cameras' pictures.
 
-        The check runs on a worker thread so the window keeps painting while
-        the camera is read; `then` runs back on the Tk thread with
-        cam2Result set. A part with no taught stripes is not checked and
-        shows OFF.
+        Runs on a worker thread so the window keeps painting while the
+        cameras are read; `then` runs back on the Tk thread with cam2Result,
+        cam1Image and cam2Image set. Camera 1's verdict comes from the PLC,
+        so only its picture is taken here. A part with no taught stripes is
+        not checked and shows OFF, though its picture is still kept.
         """
         part_number = self.partNumber
-        if stripe_check is None or not part_number or not stripe_check.has_model(part_number):
-            self.cam2Result = "OFF"
-            self.update_cam2_status("OFF")
-            then()
-            return
-
-        self.update_cam2_status("CHECKING")
+        cam1_verdict = self.cam1Result
+        checking = (stripe_check is not None and bool(part_number)
+                    and stripe_check.has_model(part_number))
+        self.cam1Image = self.cam2Image = None
+        if checking:
+            self.update_cam2_status("CHECKING")
         out = {}
 
         def work():
+            if stripe_check is None:
+                return
             try:
-                out["result"] = stripe_check.inspect(part_number)
+                frame = self.grab_camera1()
+                if frame is not None:
+                    out["cam1_image"] = captures.save(frame, "CAM1", part_number, cam1_verdict)
+            except Exception as e:
+                print(f"[CAM1] no picture: {e}")
+            try:
+                if checking:
+                    result = stripe_check.inspect(part_number)
+                    out["result"] = result
+                    verdict = ("PASS" if result.ok else
+                               "NG" if result.judgement == "NG" else "ERROR")
+                    if result.frame is not None:
+                        out["cam2_image"] = captures.save(
+                            result.frame, "CAM2", part_number, verdict,
+                            result.seen, result.stripe_boxes)
+                else:
+                    frame = stripe_check.capture_frame()
+                    if frame is not None:
+                        out["cam2_image"] = captures.save(frame, "CAM2", part_number, "OFF")
             except Exception as e:
                 out["error"] = str(e)
 
@@ -1249,8 +1287,12 @@ class EOLTesterGUI:
             if worker.is_alive():
                 self.root.after(50, wait)
                 return
+            self.cam1Image = out.get("cam1_image")
+            self.cam2Image = out.get("cam2_image")
             result = out.get("result")
-            if result is None:
+            if not checking:
+                self.cam2Result = "OFF"
+            elif result is None:
                 self.cam2Result = "ERROR"
                 self.safe_update_message(f"Camera 2 check failed: {out.get('error')}", "red")
             elif result.ok:
@@ -1259,8 +1301,9 @@ class EOLTesterGUI:
                 self.cam2Result = "NG" if result.judgement == "NG" else "ERROR"
                 self.safe_update_message(f"Camera 2 {self.cam2Result}: {result.error}", "red")
             self.update_cam2_status(self.cam2Result)
-            print(f"[CAM2] {part_number}: {self.cam2Result} "
-                  f"({(result.seen or result.error) if result else out.get('error')})")
+            if checking:
+                print(f"[CAM2] {part_number}: {self.cam2Result} "
+                      f"({(result.seen or result.error) if result else out.get('error')})")
             then()
 
         wait()
@@ -1593,7 +1636,7 @@ class EOLTesterGUI:
             else:
                 # Camera 2 looks at the stripes while the part is still in
                 # the fixture; the part is saved once that verdict is in
-                self.run_stripe_check(self.finish_test_cycle)
+                self.run_camera_checks(self.finish_test_cycle)
                 return
 
         except Exception as e:
@@ -2128,9 +2171,9 @@ class EOLTesterGUI:
             # Stop all blinking labels
             self.stop_all_label_blinking()
 
-            if self.cam2_stream is not None:
-                self.cam2_stream.release()
-                self.cam2_stream = None
+            for stream in self.camera_streams:
+                stream.release()
+            self.camera_streams = []
             
             # Clean up loadcell connections
             if hasattr(self, 'loadcell1_client') and self.loadcell1_client:
@@ -3685,6 +3728,7 @@ class EOLTesterGUI:
         if hasattr(self, 'cam1_status'):
             self.cam1_status.configure(text="CAMERA ONE\nSTATUS", bg=self.SKY)
         self.cam2Result = ""
+        self.cam1Image = self.cam2Image = None
         if hasattr(self, 'cam2_status'):
             self.cam2_status.configure(text="CAMERA TWO\nSTATUS", bg=self.SKY)
 
@@ -3722,14 +3766,16 @@ class EOLTesterGUI:
             base_columns = [
                 'TD_MACHINE_ID', 'TD_PART_NUMBER', 'TD_LOT_NUMBER', 
                 'TD_TRACEABILITY_CODE', 'TD_RECORD_DATE', 'TD_DATETIME', 
-                'L1', 'P1', 'P2', 'CAM1', 'CAM2', 'TD_OVERALL_STATUS', 'TD_EMP_CODE'
+                'L1', 'P1', 'P2', 'CAM1', 'CAM2', 'CAM1_IMAGE', 'CAM2_IMAGE',
+                'TD_OVERALL_STATUS', 'TD_EMP_CODE'
             ]
 
             base_values = [
                 self.machineID, self.partNumber, self.lotNo,
                 self.traceabilityCode, datetime.today().date(), datetime.now(),
                 self.L1MaxValue, self.P01Value, self.P02Value,
-                self.cam1Result, self.cam2Result, status, self.current_employee_id
+                self.cam1Result, self.cam2Result, self.cam1Image, self.cam2Image,
+                status, self.current_employee_id
             ]
             
             # Add optional columns based on part configuration
@@ -3768,15 +3814,18 @@ class EOLTesterGUI:
             cursor.execute("""
                 INSERT INTO TBL_TEST_RESULTS
                 (LOT_NUMBER, PART_NUMBER, L1, L2, L3, L4, P1, P2, P3, P4,
-                 CAM2, RESULT, CREATED_BY, EMP_CODE, SPEC_DATA)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 CAM1, CAM2, RESULT, CREATED_BY, EMP_CODE, SPEC_DATA,
+                 CAM1_IMAGE, CAM2_IMAGE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s)
             """, (
                 self.lotNo, self.partNumber,
                 *(measured.get(d) for d in devices),
-                self.cam2Result,
+                self.cam1Result, self.cam2Result,
                 "PASS" if status == "OK" else "NG",
                 self.current_employee_id, self.current_employee_id,
                 json.dumps({d: measured[d] for d in devices if d in measured}),
+                self.cam1Image, self.cam2Image,
             ))
             connection.commit()
 

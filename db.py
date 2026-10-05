@@ -135,13 +135,16 @@ SCHEMA = [
             P2 DECIMAL(10,3),
             P3 DECIMAL(10,3),
             P4 DECIMAL(10,3),
+            CAM1 VARCHAR(20),
             CAM2 VARCHAR(20),
             RESULT VARCHAR(10),
             SCAN_RESULT VARCHAR(10),
             CREATED_BY VARCHAR(50),
             EMP_CODE VARCHAR(50),
             SPEC_DATA TEXT,
-            CREATED_DATE TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            CREATED_DATE TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CAM1_IMAGE VARCHAR(255),
+            CAM2_IMAGE VARCHAR(255)
         )
     """),
 
@@ -164,6 +167,8 @@ SCHEMA = [
             P4 DECIMAL(10,3),
             CAM1 VARCHAR(20),
             CAM2 VARCHAR(20),
+            CAM1_IMAGE VARCHAR(255),
+            CAM2_IMAGE VARCHAR(255),
             TD_OVERALL_STATUS VARCHAR(10),
             TD_EMP_CODE VARCHAR(50),
             TD_BARCODE_SCAN_RESULT VARCHAR(10),
@@ -219,6 +224,12 @@ SCHEMA = [
 ADDED_COLUMNS = [
     ("TBL_TEST_DATA", "CAM2", "VARCHAR(20) AFTER CAM1"),
     ("TBL_TEST_RESULTS", "CAM2", "VARCHAR(20) AFTER P4"),
+    # Where each camera's picture of the test is kept, under vision_captures
+    ("TBL_TEST_DATA", "CAM1_IMAGE", "VARCHAR(255) AFTER CAM2"),
+    ("TBL_TEST_DATA", "CAM2_IMAGE", "VARCHAR(255) AFTER CAM1_IMAGE"),
+    ("TBL_TEST_RESULTS", "CAM1", "VARCHAR(20) AFTER P4"),
+    ("TBL_TEST_RESULTS", "CAM1_IMAGE", "VARCHAR(255)"),
+    ("TBL_TEST_RESULTS", "CAM2_IMAGE", "VARCHAR(255)"),
 ]
 
 

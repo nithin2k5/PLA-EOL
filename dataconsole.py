@@ -10,6 +10,15 @@ from datetime import datetime
 import csv
 import os
 
+# The cameras' pictures of each test. Without OpenCV and Pillow the page
+# still works; the camera panels then show the verdicts alone.
+try:
+    import cv2
+    from PIL import Image, ImageTk
+    from vision_engine import captures
+except ImportError:
+    captures = None
+
 
 # Results columns: heading, width, whether it takes up spare width. The
 # readings are short numbers, so they stay narrow and the spec data - the
@@ -26,6 +35,7 @@ COLUMNS = (
     ("P2", 80, False),
     ("P3", 80, False),
     ("P4", 80, False),
+    ("CAM1", 80, False),
     ("CAM2", 80, False),
     ("RESULT", 90, False),
     ("SCAN RESULT", 125, False),
@@ -37,6 +47,11 @@ COLUMNS = (
 # Where the result sits in a fetched row. The query selects the ID first, in
 # the place the NO column takes, so a row lines up with COLUMNS.
 RESULT_AT = [heading for heading, _, _ in COLUMNS].index("RESULT")
+CAM_AT = {"CAM1": [heading for heading, _, _ in COLUMNS].index("CAM1"),
+          "CAM2": [heading for heading, _, _ in COLUMNS].index("CAM2")}
+
+# Verdict colours, as on the test console's camera tiles
+VERDICT_COLOURS = {"PASS": ui.SUCCESS, "NG": ui.DANGER, "ERROR": ui.WARNING_HOVER}
 
 # Shown in a cell with no value, rather than Python's "None".
 BLANK = "—"
@@ -54,6 +69,8 @@ class DataConsole:
         self.columns = [heading for heading, _, _ in COLUMNS]
         # The rows on show, as raw values, for the export.
         self.export_rows = []
+        # Each row's camera verdicts and pictures, by table row id
+        self.row_cameras = {}
 
         ui.page_header(self.root, "Work Data")
         # The footer is packed before the body so it keeps the foot of the window
@@ -64,6 +81,8 @@ class DataConsole:
 
         self.create_filter_bar(body)
         self.create_summary(body)
+        # Packed from the bottom before the table, so the table takes the rest
+        self.create_camera_panels(body)
         self.create_table(body)
 
         self.load_part_numbers()
@@ -231,11 +250,82 @@ class DataConsole:
         self.result_table.tag_configure('plain', background=ui.ROW_PLAIN)
         self.result_table.tag_configure('ng', foreground=ui.DANGER)
 
+        self.result_table.bind("<<TreeviewSelect>>", self.show_cameras)
+
         # Laid over the table while it has nothing to show.
         self.empty_label = tk.Label(table_frame, bg=ui.SURFACE, fg=ui.TEXT_MUTED,
                                     font=ui.FONT_SECTION,
                                     text="Choose the filters above and press Search.")
         self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+
+    def create_camera_panels(self, parent):
+        """CAMERA 1 and CAMERA 2: what each camera saw of the selected test."""
+        row = tk.Frame(parent, bg=ui.APP_BG, height=290)
+        row.pack(side=tk.BOTTOM, fill=tk.X, pady=(ui.PAD_LARGE, 0))
+        # A fixed height, so a picture never pushes the table off the page
+        row.grid_propagate(False)
+        row.grid_rowconfigure(0, weight=1)
+
+        self.camera_panels = {}
+        for column, (key, title) in enumerate((("CAM1", "CAMERA 1"), ("CAM2", "CAMERA 2"))):
+            row.grid_columnconfigure(column, weight=1, uniform='camera')
+            card = ui.ctk_card(row)
+            card.grid(row=0, column=column, sticky="nsew",
+                      padx=(0 if column == 0 else ui.PAD_LARGE, 0))
+            header = ui.ctk_card_header(card, title, icon='camera')
+            # A badge in the verdict's colour, as on the test console's tiles
+            verdict = ctk.CTkLabel(header, text="", fg_color=ui.NAVY, width=70,
+                                   corner_radius=ui.CORNER_RADIUS_SMALL,
+                                   text_color=ui.TEXT_ON_DARK,
+                                   font=(ui.FONT_FAMILY, 13, 'bold'))
+            verdict.pack(side='right', padx=ui.PAD_LARGE, pady=4)
+
+            picture = tk.Label(card, bg=ui.SUBTLE, fg=ui.TEXT_MUTED,
+                               font=ui.FONT_BODY, text="Select a result to see its picture")
+            picture.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE,
+                         pady=(ui.PAD, ui.PAD_LARGE))
+            panel = {"verdict": verdict, "picture": picture, "image": None, "photo": None}
+            # Fit the picture again whenever the panel changes size
+            picture.bind("<Configure>", lambda e, p=panel: self.fit_picture(p))
+            self.camera_panels[key] = panel
+
+    def show_cameras(self, event=None):
+        """Fill both camera panels from the selected result row."""
+        selected = self.result_table.selection()
+        cameras = self.row_cameras.get(selected[0]) if selected else None
+        for key, panel in self.camera_panels.items():
+            verdict, picture = cameras[key] if cameras else ("", None)
+            panel["verdict"].configure(
+                text=verdict or "",
+                fg_color=VERDICT_COLOURS.get(str(verdict).upper(), ui.NAVY))
+            panel["image"] = captures.load(picture) if captures and picture else None
+            if panel["image"] is None:
+                panel["photo"] = None
+                if not cameras:
+                    note = "Select a result to see its picture"
+                elif picture and captures:
+                    note = "This picture is no longer kept"
+                else:
+                    note = "No picture was taken for this test"
+                panel["picture"].configure(image="", text=note)
+            self.fit_picture(panel)
+
+    @staticmethod
+    def fit_picture(panel):
+        """Show the panel's picture as large as fits, keeping its shape."""
+        img = panel["image"]
+        label = panel["picture"]
+        if img is None:
+            return
+        w, h = label.winfo_width() - 4, label.winfo_height() - 4
+        if w < 10 or h < 10:
+            return
+        scale = min(w / img.shape[1], h / img.shape[0])
+        size = (max(1, int(img.shape[1] * scale)), max(1, int(img.shape[0] * scale)))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        panel["photo"] = ImageTk.PhotoImage(
+            Image.fromarray(rgb).resize(size, Image.Resampling.BILINEAR))
+        label.configure(image=panel["photo"], text="")
 
     # ------------------------------------------------------------------
     # Data
@@ -278,6 +368,7 @@ class DataConsole:
         """
         self.result_table.delete(*self.result_table.get_children())
         self.export_rows = []
+        self.row_cameras = {}
 
         start = self.start_date_entry.get_date()
         end = self.end_date_entry.get_date()
@@ -293,7 +384,8 @@ class DataConsole:
             query = """
                 SELECT
                     ID, LOT_NUMBER, PART_NUMBER, L1, L2, L3, L4, P1, P2, P3, P4,
-                    CAM2, RESULT, SCAN_RESULT, EMP_CODE, SPEC_DATA, CREATED_DATE
+                    CAM1, CAM2, RESULT, SCAN_RESULT, EMP_CODE, SPEC_DATA, CREATED_DATE,
+                    CAM1_IMAGE, CAM2_IMAGE
                 FROM TBL_TEST_RESULTS
                 WHERE DATE(CREATED_DATE) BETWEEN %s AND %s
             """
@@ -309,7 +401,8 @@ class DataConsole:
                 query += " AND RESULT = %s"
                 params.append(result_filter)
 
-            query += " ORDER BY CREATED_DATE DESC"
+            # Newest first; tests saved in the same second by the order saved
+            query += " ORDER BY CREATED_DATE DESC, ID DESC"
 
             cursor.execute(query, tuple(params))
             records = cursor.fetchall()
@@ -328,13 +421,23 @@ class DataConsole:
                 conn.close()
 
         for i, record in enumerate(records, 1):
-            raw = [i] + list(record)[1:]  # Add row number, skip ID
+            # The table's columns, then the two pictures' paths
+            shown, pictures = record[:len(COLUMNS)], record[len(COLUMNS):]
+            raw = [i] + list(shown)[1:]  # Add row number, skip ID
             self.export_rows.append(raw)
             tags = ['band' if ((i - 1) // 5) % 2 == 0 else 'plain']
             if str(record[RESULT_AT]).upper() == 'NG':
                 tags.append('ng')
-            self.result_table.insert('', 'end', values=[self.display(v) for v in raw],
-                                     tags=tuple(tags))
+            row_id = self.result_table.insert('', 'end', values=[self.display(v) for v in raw],
+                                              tags=tuple(tags))
+            self.row_cameras[row_id] = {"CAM1": (record[CAM_AT["CAM1"]], pictures[0]),
+                                        "CAM2": (record[CAM_AT["CAM2"]], pictures[1])}
+
+        # Open on the newest test's pictures
+        rows = self.result_table.get_children()
+        if rows:
+            self.result_table.selection_set(rows[0])
+        self.show_cameras()
 
         self.range_label.configure(text="{} to {}{}".format(
             start.strftime('%d-%m-%Y'), end.strftime('%d-%m-%Y'),

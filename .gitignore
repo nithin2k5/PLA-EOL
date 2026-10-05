@@ -9,3 +9,6 @@ archive/
 
 # Operator actions written when the database is unreachable - local to each machine
 logs/operator_actions.log
+
+# Camera pictures kept with each test - local to each machine
+vision_captures/
