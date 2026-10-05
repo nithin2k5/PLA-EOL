@@ -20,6 +20,13 @@ import db
 import ui
 from plc_address import bit_address
 
+# Camera 2 checks the stripes on the cable. Without OpenCV the console still
+# runs, and camera 2 shows OFF.
+try:
+    from vision_engine import camera, stripe_check
+except ImportError:
+    camera = stripe_check = None
+
 
 class SerializedModbusClient:
     """A Modbus client that lets one request through at a time.
@@ -301,6 +308,7 @@ class EOLTesterGUI:
         self.columnP3 = False
         self.columnP4 = False
         self.cam1Result = ""
+        self.cam2Result = ""
         self.deviceToRead = []
         self.inputSensorsToReadList = []
         self.mldDataTable = []
@@ -421,6 +429,8 @@ class EOLTesterGUI:
         
         # Camera and Alert Variables
         self.cam1Result = ""
+        self.cam2Result = ""
+        self.cam2_stream = None
         self.resetPLCOnFormClosing = False
         self.machineOnPLCCoilAddress = ""
         self.alertOnPLCCoilAddress = ""
@@ -718,9 +728,9 @@ class EOLTesterGUI:
                                     font=(self.FONT, 15, 'bold'))
         self.cam1_status.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # Camera 2 has no PLC signals yet, so it stays at rest
+        # Camera 2 is judged by the app itself: the stripes on the cable
         self.cam2_status = tk.Label(group(1, "CAMERA 2"), text="CAMERA TWO\nSTATUS",
-                                    bg=self.SILVER, fg='black', height=2,
+                                    bg=self.SKY, fg='black', height=2,
                                     font=(self.FONT, 15, 'bold'))
         self.cam2_status.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
@@ -1185,7 +1195,75 @@ class EOLTesterGUI:
 
     def connect_to_devices(self):
         """Report the console ready once its window is built."""
+        self.open_camera2()
         self.safe_update_message("System ready.", "green")
+
+    def open_camera2(self):
+        """Keep camera 2 streaming while the console is open.
+
+        A camera opened cold needs about a second for its exposure to settle.
+        Holding the stream open means each stripe check judges a settled frame
+        straight away instead of adding that wait to every cycle.
+        """
+        if stripe_check is None:
+            return
+        index, width, height = stripe_check.camera_settings()
+        if index >= 0:
+            self.cam2_stream = camera.acquire(index, width, height)
+
+    def update_cam2_status(self, result):
+        """Show camera 2's verdict: PASS, NG, ERROR, OFF or CHECKING."""
+        fills = {"PASS": '#00FF00', "NG": '#FF0000', "ERROR": '#FFA500',
+                 "OFF": self.SILVER, "CHECKING": self.SKY}
+        self.cam2_status.configure(text="CAMERA TWO\n" + result,
+                                   bg=fills.get(result, self.SKY))
+
+    def run_stripe_check(self, then):
+        """Check the part's stripes on camera 2, then call `then`.
+
+        The check runs on a worker thread so the window keeps painting while
+        the camera is read; `then` runs back on the Tk thread with
+        cam2Result set. A part with no taught stripes is not checked and
+        shows OFF.
+        """
+        part_number = self.partNumber
+        if stripe_check is None or not part_number or not stripe_check.has_model(part_number):
+            self.cam2Result = "OFF"
+            self.update_cam2_status("OFF")
+            then()
+            return
+
+        self.update_cam2_status("CHECKING")
+        out = {}
+
+        def work():
+            try:
+                out["result"] = stripe_check.inspect(part_number)
+            except Exception as e:
+                out["error"] = str(e)
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        def wait():
+            if worker.is_alive():
+                self.root.after(50, wait)
+                return
+            result = out.get("result")
+            if result is None:
+                self.cam2Result = "ERROR"
+                self.safe_update_message(f"Camera 2 check failed: {out.get('error')}", "red")
+            elif result.ok:
+                self.cam2Result = "PASS"
+            else:
+                self.cam2Result = "NG" if result.judgement == "NG" else "ERROR"
+                self.safe_update_message(f"Camera 2 {self.cam2Result}: {result.error}", "red")
+            self.update_cam2_status(self.cam2Result)
+            print(f"[CAM2] {part_number}: {self.cam2Result} "
+                  f"({(result.seen or result.error) if result else out.get('error')})")
+            then()
+
+        wait()
 
     def connect_to_plc(self):
         """Connect to PLC using configuration from .env file"""
@@ -1513,7 +1591,10 @@ class EOLTesterGUI:
                     self.endingNGCableValidated = False
                     self.log_operator_action("NG_CHECK_END_FAILED", "Known-bad cable passed every device")
             else:
-                self.complete_test_cycle()
+                # Camera 2 looks at the stripes while the part is still in
+                # the fixture; the part is saved once that verdict is in
+                self.run_stripe_check(self.finish_test_cycle)
+                return
 
         except Exception as e:
             print(f"Error in test_result_command: {e}")
@@ -1521,6 +1602,13 @@ class EOLTesterGUI:
             self.safe_update_message(f"Error processing test results: {e}", "red")
 
         self.root.after(1200, self.prepare_next_cycle)
+
+    def finish_test_cycle(self):
+        """Save the scored part, then get ready for the next one."""
+        try:
+            self.complete_test_cycle()
+        finally:
+            self.root.after(1200, self.prepare_next_cycle)
 
     def score_spec_rows(self):
         """Fill Actual and Result on every spec row and count passes and fails."""
@@ -2039,6 +2127,10 @@ class EOLTesterGUI:
             
             # Stop all blinking labels
             self.stop_all_label_blinking()
+
+            if self.cam2_stream is not None:
+                self.cam2_stream.release()
+                self.cam2_stream = None
             
             # Clean up loadcell connections
             if hasattr(self, 'loadcell1_client') and self.loadcell1_client:
@@ -3480,8 +3572,11 @@ class EOLTesterGUI:
                 messagebox.showwarning("Duplicate Code", 
                     f"Generated Traceability Code: {self.traceabilityCode} already exists. Saving as 'NG'.")
                 self.save_testing_data("NG")
-            elif self.passCounter == len(self.deviceToRead):
-                # All tests passed
+            elif (self.passCounter == len(self.deviceToRead)
+                  and self.cam2Result not in ("NG", "ERROR")):
+                # All tests passed, and camera 2 found the right stripes or
+                # had none to check. A camera 2 error fails the part too:
+                # its stripes were never confirmed.
                 self.save_testing_data("OK")
                 # Print barcode if configured
                 if self.barcodePrintFileName and self.barcodePrintFileName != "NO_BARCODE_PRINT_FILE":
@@ -3589,6 +3684,9 @@ class EOLTesterGUI:
         self.cam1Result = ""
         if hasattr(self, 'cam1_status'):
             self.cam1_status.configure(text="CAMERA ONE\nSTATUS", bg=self.SKY)
+        self.cam2Result = ""
+        if hasattr(self, 'cam2_status'):
+            self.cam2_status.configure(text="CAMERA TWO\nSTATUS", bg=self.SKY)
 
     def reset_measurements(self):
         """Zero the readings so the next test's peaks start from nothing."""
