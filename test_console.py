@@ -99,7 +99,7 @@ class LiveCameraView(tk.Frame):
 
     REFRESH_MS = 80
 
-    def __init__(self, parent, height, font, idle_fill):
+    def __init__(self, parent, height, font, idle_fill, on_click=None):
         super().__init__(parent, bg='black')
         box = tk.Frame(self, bg='black', height=height)
         box.pack(fill="x")
@@ -109,6 +109,10 @@ class LiveCameraView(tk.Frame):
         self.strip = tk.Label(self, text="STATUS", bg=idle_fill, fg='black',
                               font=(font, 12, 'bold'))
         self.strip.pack(fill="x")
+        if on_click:
+            # Click the picture to choose which camera feeds it
+            self.picture.configure(cursor="hand2")
+            self.picture.bind("<Button-1>", lambda e: on_click())
         self.stream = None
         self.held = None
         self.photo = None
@@ -503,6 +507,7 @@ class EOLTesterGUI:
         self.cam1Image = None       # pictures of this test, relative paths
         self.cam2Image = None
         self.camera_streams = {}    # by camera source, e.g. "cam2"
+        self.camera_check_running = False
         self.resetPLCOnFormClosing = False
         self.machineOnPLCCoilAddress = ""
         self.alertOnPLCCoilAddress = ""
@@ -801,9 +806,11 @@ class EOLTesterGUI:
         # missing parts (its verdict comes from the PLC); camera 2 checks the
         # stripes on the cable, judged by the app itself.
         live_height = round(self.LIVE_HEIGHT * self.image_scale)
-        self.cam1_view = LiveCameraView(group(0, "CAMERA 1"), live_height, self.FONT, self.SKY)
+        self.cam1_view = LiveCameraView(group(0, "CAMERA 1"), live_height, self.FONT, self.SKY,
+                                        on_click=lambda: self.configure_camera(1))
         self.cam1_view.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.cam2_view = LiveCameraView(group(1, "CAMERA 2"), live_height, self.FONT, self.SKY)
+        self.cam2_view = LiveCameraView(group(1, "CAMERA 2"), live_height, self.FONT, self.SKY,
+                                        on_click=lambda: self.configure_camera(2))
         self.cam2_view.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # Where the printed label gets scanned back in. It only opens while a
@@ -1289,14 +1296,47 @@ class EOLTesterGUI:
             for view in (self.cam1_view, self.cam2_view):
                 view.set_stream(None, "Camera support not installed")
             return
+        self.start_camera_streams()
+        threading.Thread(target=captures.remove_old, daemon=True).start()
+
+    def start_camera_streams(self):
+        """Open each camera that is set up and show it on its live view."""
         for source, view in ((self.camera1_source(), self.cam1_view),
                              (stripe_check.CAMERA_SOURCE, self.cam2_view)):
             index, width, height = load_camera_config(source)
-            if index >= 0:
+            if index >= 0 and source not in self.camera_streams:
                 self.camera_streams[source] = camera.acquire(index, width, height)
-            view.set_stream(self.camera_streams.get(source),
-                            "Not set up\n(Vision Settings)")
-        threading.Thread(target=captures.remove_old, daemon=True).start()
+            view.set_stream(self.camera_streams.get(source), "Not set up\n(click to choose)")
+
+    def stop_camera_streams(self, note=""):
+        for view in (self.cam1_view, self.cam2_view):
+            view.set_stream(None, note)
+        for stream in self.camera_streams.values():
+            stream.release()
+        self.camera_streams = {}
+
+    def configure_camera(self, number):
+        """Choose the device for camera 1 or 2, from its live view.
+
+        The dialog looks for cameras by opening each device in turn, and a
+        device can only be opened once at a time, so the console lets go of
+        its cameras while the dialog is open and takes them back after.
+        """
+        if stripe_check is None:
+            return
+        if self.camera_check_running:
+            self.safe_update_message("Wait for the camera check to finish.", "red")
+            return
+        import vision_settings
+        if number == 1:
+            source, title = self.camera1_source(), "Camera 1 (missing parts)"
+        else:
+            source, title = stripe_check.CAMERA_SOURCE, "Camera 2 (stripes)"
+        self.stop_camera_streams("Setting up…")
+        try:
+            vision_settings._open_camera_dialog(self.root, source, title)
+        finally:
+            self.start_camera_streams()
 
     def grab_camera1(self):
         """A frame from camera 1, or None if it isn't a USB camera set up here."""
@@ -1323,6 +1363,7 @@ class EOLTesterGUI:
         checking = (stripe_check is not None and bool(part_number)
                     and stripe_check.has_model(part_number))
         self.cam1Image = self.cam2Image = None
+        self.camera_check_running = True
         if checking:
             self.update_cam2_status("CHECKING")
         out = {}
@@ -1364,6 +1405,7 @@ class EOLTesterGUI:
             if worker.is_alive():
                 self.root.after(50, wait)
                 return
+            self.camera_check_running = False
             self.cam1Image = out.get("cam1_image")
             self.cam2Image = out.get("cam2_image")
             # Hold what was judged on screen until the next part
@@ -2251,9 +2293,7 @@ class EOLTesterGUI:
             # Stop all blinking labels
             self.stop_all_label_blinking()
 
-            for stream in self.camera_streams.values():
-                stream.release()
-            self.camera_streams = {}
+            self.stop_camera_streams()
             
             # Clean up loadcell connections
             if hasattr(self, 'loadcell1_client') and self.loadcell1_client:
