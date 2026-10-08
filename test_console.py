@@ -684,15 +684,29 @@ class EOLTesterGUI:
         return bool(load_vision_config().get("vision_enabled", True))
 
     def toggle_vision_check(self):
-        """Save the VISION CHECK choice; it applies from the next test started."""
+        """Change VISION CHECK after a login; it applies from the next test started.
+
+        Turning the cameras off lets parts pass without them, so the change
+        needs the same login as Settings and Vision Settings.
+        """
+        from login_form import prompt_login
+
         on = self.vision_check_var.get()
+        # The box has already changed on the click; put it back until
+        # someone has logged in
+        self.vision_check_var.set(not on)
+        user = prompt_login(self.root)
+        if user is None:
+            self.safe_update_message("Vision check not changed - a login is needed.", "red")
+            return
+        self.vision_check_var.set(on)
         try:
             cfg = load_vision_config()
             cfg["vision_enabled"] = on
             save_vision_config(cfg)
         except OSError as e:
             messagebox.showerror("Vision Check", f"Could not save the setting: {e}")
-        self.log_operator_action("VISION_CHECK", "On" if on else "Off")
+        self.log_operator_action("VISION_CHECK", f"{'On' if on else 'Off'} by {user}")
         self.safe_update_message(
             "Vision check on - the cameras check each part." if on else
             "Vision check off - the cameras will not check the parts.",
