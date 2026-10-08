@@ -1004,6 +1004,9 @@ class EOLTesterGUI:
         self.alc_entry.bind("<FocusOut>", lambda e: self.on_alc_entry_focus(False))
         self.alc_entry.bind("<Return>", self.process_alc_code)
 
+        self.watch_placeholder(self.emp_entry)
+        self.watch_placeholder(self.alc_entry)
+
         return panel
 
     def create_scan_counters(self, parent_frame):
@@ -1276,12 +1279,41 @@ class EOLTesterGUI:
         entry.delete(0, tk.END)
         entry.insert(0, text)
         entry.configure(fg=self.PLACEHOLDER_INK, state=state)
+        # Remembered on the box, so the watermark is taken out however the
+        # operator gets to it - not only when the box gains focus
+        entry.placeholder = text
 
-    def clear_placeholder(self, entry, text):
+    def clear_placeholder(self, entry, text=None):
         """Take the watermark out so the operator types into an empty box."""
-        if entry.get() == text:
+        if str(entry.cget('state')) != 'normal':
+            return
+        if getattr(entry, 'placeholder', None) and entry.get() == entry.placeholder:
             entry.delete(0, tk.END)
+        entry.placeholder = None
         entry.configure(fg='black')
+
+    def watch_placeholder(self, entry):
+        """Clear a code box's watermark on the first key, click or paste.
+
+        Focus alone isn't enough: after a test the ALC box gets its
+        watermark back while it still has the focus, so clicking it again
+        gains nothing, and what was typed went in grey after "ALC CODE".
+        These run before the box's own handling, so the box is empty by the
+        time the key is put in.
+        """
+        def on_key(event):
+            if getattr(entry, 'placeholder', None) and (
+                    (event.char and event.char.isprintable())
+                    or event.keysym in ('BackSpace', 'Delete')):
+                self.clear_placeholder(entry)
+
+        def on_click_or_paste(event):
+            if getattr(entry, 'placeholder', None):
+                self.clear_placeholder(entry)
+
+        entry.bind("<Key>", on_key, add="+")
+        entry.bind("<Button-1>", on_click_or_paste, add="+")
+        entry.bind("<<Paste>>", on_click_or_paste, add="+")
 
     def on_emp_entry_focus(self, is_focused):
         """Handle employee code entry focus"""
@@ -2078,6 +2110,7 @@ class EOLTesterGUI:
 
         # Check if we're waiting for employee code
         if not self.emp_entry.get() or self.emp_entry.get() == self.EMP_PLACEHOLDER:
+            self.clear_placeholder(self.emp_entry)
             self.emp_entry.delete(0, tk.END)
             self.emp_entry.insert(0, barcode)
             self.validate_employee_code()
@@ -2087,6 +2120,7 @@ class EOLTesterGUI:
             
         # If ALC code is enabled and a barcode is scanned, process it
         elif self.alc_entry.cget('state') == 'normal':
+            self.clear_placeholder(self.alc_entry)
             self.alc_entry.delete(0, tk.END)
             self.alc_entry.insert(0, barcode)
             self.process_alc_code()
