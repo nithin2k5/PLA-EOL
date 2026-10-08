@@ -133,6 +133,12 @@ class MainConsole(tk.Tk):
     STALE_TEST_WARNING_DAYS = 2
     # Share of the window width given to the side navigation.
     NAV_SHARE = 0.05
+    # The tab on the navigation's edge that slides it away and back.
+    NAV_TAB_WIDTH = 22
+    NAV_TAB_HEIGHT = 64
+    # How long the slide takes, and in how many steps.
+    NAV_SLIDE_MS = 200
+    NAV_SLIDE_STEPS = 12
 
     def __init__(self):
         super().__init__()
@@ -196,21 +202,14 @@ class MainConsole(tk.Tk):
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
 
-        # A tenth of the width to the navigation, the rest to the page. The
-        # uniform group is what makes grid share the width out by weight;
-        # without it each column would take whatever its content asked for,
-        # and the consoles ask for a great deal.
-        nav_weight = round(self.NAV_SHARE * 100)
-        body.grid_columnconfigure(0, weight=nav_weight, uniform='shell')
-        body.grid_columnconfigure(1, weight=100 - nav_weight, uniform='shell')
+        # Pages are built in here, filling the window; the navigation slides
+        # over them. Propagation is off so that a console laid out wider
+        # than the window cannot stretch it.
+        self.body = body
         body.grid_rowconfigure(0, weight=1)
-
-        self.build_side_nav(body).grid(row=0, column=0, sticky="nsew")
-
-        # Pages are built in here. Propagation is off so that a console laid
-        # out wider than its share cannot push the navigation off the window.
+        body.grid_columnconfigure(0, weight=1)
         self.page_host = ttk.Frame(body, width=1, height=1)
-        self.page_host.grid(row=0, column=1, sticky="nsew")
+        self.page_host.grid(row=0, column=0, sticky="nsew")
         self.page_host.pack_propagate(False)
 
         self.page = None
@@ -222,6 +221,8 @@ class MainConsole(tk.Tk):
                  text="Choose a console from the navigation on the left.").pack(
                      fill="both", expand=True)
         self.show_placeholder()
+
+        self.build_nav_drawer(body)
 
         # Create menu. A tk.Menu is drawn by the window manager rather than
         # by the theme, so it keeps a system-light bar above a dark window
@@ -299,6 +300,66 @@ class MainConsole(tk.Tk):
         self.btn_exit.grid(row=rule + 1, column=0, sticky="nsew", padx=6, pady=6)
 
         return nav
+
+    def build_nav_drawer(self, parent):
+        """The navigation, laid over the page's left edge, and its tab.
+
+        It slides over the page rather than taking width from it: moving one
+        panel is smooth, where resizing the page at every step of the slide
+        made the whole console redraw and judder.
+        """
+        self.nav_width = max(60, round(self.winfo_screenwidth() * self.NAV_SHARE))
+        self.nav = self.build_side_nav(parent)
+        self.nav.configure(width=self.nav_width)
+
+        # A navy tab on the navigation's right edge, halfway down, carrying
+        # the triangle. It travels with the navigation and is left at the
+        # window's edge when the navigation is away, to bring it back. It is
+        # placed by a plain frame around it, because CTk scales a widget's
+        # own place() coordinates for the display and it would then sit
+        # adrift of the navigation's edge.
+        self.nav_tab_holder = tk.Frame(parent, bg=ui.NAVY, exact_colors=True)
+        self.nav_tab = ctk.CTkButton(
+            self.nav_tab_holder, text='', command=self.toggle_nav,
+            width=self.NAV_TAB_WIDTH, height=self.NAV_TAB_HEIGHT,
+            corner_radius=0, border_width=0, fg_color=ui.NAVY,
+            hover_color=NavButton.HOVER, cursor='hand2',
+            image=ui.icon_image('triangle_left', ui.TEXT_ON_DARK, 16))
+        self.nav_tab.pack()
+
+        self.nav_open = True
+        self.place_nav(1)
+
+    def place_nav(self, shown):
+        """Put the navigation `shown` of the way out (0 hidden, 1 fully out)."""
+        x = round(-self.nav_width * (1 - shown))
+        self.nav.place(x=x, y=0, relheight=1, width=self.nav_width)
+        self.nav_tab_holder.place(x=x + self.nav_width, rely=0.5, anchor='w')
+        self.nav.lift()
+        self.nav_tab_holder.lift()
+
+    def toggle_nav(self):
+        """Slide the navigation away, or back, with the tab on its edge."""
+        if getattr(self, '_nav_sliding', False):
+            return
+        self.nav_open = not self.nav_open
+        self.nav_tab.configure(image=ui.icon_image(
+            'triangle_left' if self.nav_open else 'triangle_right',
+            ui.TEXT_ON_DARK, 16))
+        self._nav_sliding = True
+
+        steps = self.NAV_SLIDE_STEPS
+
+        def step(n):
+            # Eased, so it starts quickly and settles gently.
+            done = 1 - (1 - n / steps) ** 2
+            self.place_nav(done if self.nav_open else 1 - done)
+            if n < steps:
+                self.after(self.NAV_SLIDE_MS // steps, step, n + 1)
+            else:
+                self._nav_sliding = False
+
+        step(1)
 
     def nav_button(self, nav, icon, label, command, danger=False):
         button = NavButton(nav, icon, label, command, danger=danger)

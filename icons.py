@@ -130,6 +130,26 @@ def _arrow_right(size, color):
     return img
 
 
+def _triangle(size, color, pointing):
+    """A solid triangle, drawn four times over and scaled down so its slopes
+    come out smooth rather than stepped."""
+    big = size * 4
+    img, d = _canvas(big)
+    near, far = big * 0.3, big * 0.75
+    if pointing == 'left':
+        near, far = big - near, big - far
+    d.polygon([(near, big * 0.18), (far, big / 2), (near, big * 0.82)], fill=color)
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def _triangle_left(size, color):
+    return _triangle(size, color, 'left')
+
+
+def _triangle_right(size, color):
+    return _triangle(size, color, 'right')
+
+
 def _gear(size, color):
     import math
     img, d = _canvas(size)
@@ -314,6 +334,7 @@ _DRAWERS = {
     'bars': _bars, 'shield': _shield, 'question': _question, 'mail': _mail,
     'power': _power, 'box': _box, 'clipboard': _clipboard, 'chart': _chart,
     'list': _list, 'alert': _alert, 'check': _check, 'info': _info,
+    'triangle_left': _triangle_left, 'triangle_right': _triangle_right,
 }
 
 
