@@ -550,6 +550,39 @@ def _patch_one(widget_class):
     widget_class.config = patched_configure
 
 
+class PaddedEntry(tk.Entry):
+    """A classic Entry with a little room between its text and its edge.
+
+    The palette gives every Entry a one-pixel solid edge, and gives it again
+    on each configure call made without a colour, so text sits hard against
+    the border. This one keeps a flat border painted in the entry's own
+    colour inside a one-pixel outline, through every later configure call,
+    so the text stays inset whatever state or colour the page sets. At
+    PAD = 4 it stands as tall as a themed combobox, so the two line up.
+    """
+
+    PAD = 4
+
+    def __init__(self, master=None, cnf=None, **kw):
+        super().__init__(master, **self._padded(dict(cnf or {}, **kw)))
+
+    def configure(self, cnf=None, **kw):
+        if isinstance(cnf, str) or (cnf is None and not kw):
+            return super().configure(cnf, **kw)    # reading an option back
+        return super().configure(**self._padded(dict(cnf or {}, **kw)))
+
+    config = configure
+
+    @classmethod
+    def _padded(cls, options):
+        options.setdefault('relief', 'flat')
+        options.setdefault('borderwidth', cls.PAD)
+        options.setdefault('highlightthickness', 1)
+        options.setdefault('highlightbackground', BORDER)
+        options.setdefault('highlightcolor', ACCENT)
+        return options
+
+
 def apply(root):
     """Give this window the shared look. Safe to call from every page."""
     _patch_tk_widgets()

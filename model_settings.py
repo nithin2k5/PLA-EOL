@@ -17,6 +17,21 @@ class WorkspaceApp:
     MAX_SPECIFICATIONS = 8
     NUMERIC_SPEC_FIELDS = ('Master Min', 'Master Max', 'Normal Min', 'Normal Max')
 
+    # What each part detail box shows while it is empty. Every place that
+    # fills, clears or reads a box uses this one list, so a placeholder is
+    # never mistaken for something typed - and so never saved as data.
+    PLACEHOLDERS = {
+        "Vendor Code": "Enter vendor code",
+        "EO Number": "Enter EO number",
+        "Special Data": "Enter special data",
+        "Initial ID": "Enter initial ID",
+        "Part Number": "Enter part number",
+        "Supplier Section": "Enter supplier details",
+        "Model & Part Name": "Enter model & part name",
+        "Image File Path": "No image selected",
+        "ALC Code": "Enter ALC code",
+    }
+
     def __init__(self, root, user=None):
         self.root = root
         ui.apply(root)
@@ -172,12 +187,16 @@ class WorkspaceApp:
     def create_bottom_sections(self, container):
         # Headers
         headers = ["SPECIFICATIONS", "LABEL DETAILS", "PARTS LIST"]
+        # Shares of the row's width. Fixed, so a long line in one section
+        # can't squeeze the others: the specifications have seven fields,
+        # the other two three columns each.
+        shares = (4, 3, 3)
         sections = []
-        
+
         for i, header in enumerate(headers):
             section_frame = tk.Frame(container, relief="groove", borderwidth=1)
             section_frame.grid(row=0, column=i, sticky="nsew", padx=1, pady=1)
-            container.grid_columnconfigure(i, weight=1)
+            container.grid_columnconfigure(i, weight=shares[i], uniform='section')
             
             # Header
             header_label = tk.Label(section_frame,
@@ -217,12 +236,18 @@ class WorkspaceApp:
             ("Normal Max", 1, 3, 1)
         ]
         
+        # Four equal columns that share the section's width. Without this
+        # each box asked for its default 20 characters and the last column,
+        # Master Max and Normal Max, ran off the right-hand edge.
+        for col in range(4):
+            input_frame.grid_columnconfigure(col, weight=1, uniform='spec')
+
         self.spec_entries = {}
         for label_text, row, col, span in entries:
             label = tk.Label(input_frame, text=label_text, anchor='w')
             label.grid(row=row*2, column=col, columnspan=span, sticky='w', padx=5)
-            
-            entry = tk.Entry(input_frame)
+
+            entry = ui.PaddedEntry(input_frame, width=1)
             entry.grid(row=row*2+1, column=col, columnspan=span, sticky='ew', padx=5, pady=2)
             if label_text in self.NUMERIC_SPEC_FIELDS:
                 self.restrict_to_number(entry)
@@ -265,22 +290,26 @@ class WorkspaceApp:
 
         # Specifications Treeview
         columns = ('description', 'device', 'unit', 'master_min', 'master_max', 'normal_min', 'normal_max')
-        self.spec_tree = ttk.Treeview(frame, columns=columns, show='headings', height=10)
-        
+        # A heading shows one line only, so "MASTER MIN" rather than two
+        # lines, in a font small enough for seven columns to fit
+        ttk.Style().configure("Spec.Settings.Treeview.Heading",
+                              font=(ui.FONT_FAMILY, 9, 'bold'), padding=(2, ui.PAD))
+        self.spec_tree = ttk.Treeview(frame, columns=columns, show='headings', height=10,
+                                      style="Spec.Settings.Treeview")
 
         headings = {
-            'description': 'DESCRIPTION',
-            'device': 'DEVICE',
-            'unit': 'UNIT',
-            'master_min': 'MASTER\nMIN',
-            'master_max': 'MASTER\nMAX',
-            'normal_min': 'NORMAL\nMIN',
-            'normal_max': 'NORMAL\nMAX'
+            'description': ('DESCRIPTION', 130),
+            'device': ('DEVICE', 70),
+            'unit': ('UNIT', 60),
+            'master_min': ('MASTER MIN', 95),
+            'master_max': ('MASTER MAX', 95),
+            'normal_min': ('NORMAL MIN', 95),
+            'normal_max': ('NORMAL MAX', 95),
         }
-        
-        for col, heading in headings.items():
+
+        for col, (heading, width) in headings.items():
             self.spec_tree.heading(col, text=heading)
-            self.spec_tree.column(col, width=100, anchor='center')
+            self.spec_tree.column(col, width=width, minwidth=50, anchor='center')
 
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.spec_tree.yview)
         self.spec_tree.configure(yscrollcommand=scrollbar.set)
@@ -316,8 +345,11 @@ class WorkspaceApp:
         # Add tooltip to show editing instructions
         tooltip_text = ("Double-click ON or OFF text to edit (placed labels only). "
                         "The Test console shows the OFF text until the sensor turns on.")
-        tooltip = tk.Label(frame, text=tooltip_text, bg='lightyellow')
-        tooltip.pack(pady=(0, 5))
+        tooltip = tk.Label(frame, text=tooltip_text, bg='lightyellow',
+                           justify='left', anchor='w')
+        tooltip.pack(fill=tk.X, padx=5, pady=(0, 5))
+        # Wrap to the section's width rather than run off both ends
+        tooltip.bind('<Configure>', lambda e: tooltip.configure(wraplength=max(100, e.width - 10)))
         
         # Add scrollbar
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -341,10 +373,10 @@ class WorkspaceApp:
         self.part_list_tree.heading('model_name', text='Model Name')
         self.part_list_tree.heading('created_date', text='Created Date')
         
-        # Set column widths
-        self.part_list_tree.column('part_number', width=70)
-        self.part_list_tree.column('model_name', width=100)
-        self.part_list_tree.column('created_date', width=150)
+        # Widths that fit the section and stretch with it
+        self.part_list_tree.column('part_number', width=110, minwidth=70)
+        self.part_list_tree.column('model_name', width=150, minwidth=80)
+        self.part_list_tree.column('created_date', width=170, minwidth=90)
         
         # Add scrollbar
         scrollbar = ttk.Scrollbar(part_list_frame, orient=tk.VERTICAL, command=self.part_list_tree.yview)
@@ -392,15 +424,15 @@ class WorkspaceApp:
         
         # Create textboxes for each field
         fields = [
-            ("Vendor Code", "Enter vendor code", 0, 0),
-            ("EO Number", "Enter EO number", 0, 1),
-            ("Special Data", "Enter special data", 1, 0),
-            ("Initial ID", "Enter initial ID", 1, 1),
-            ("Part Number", "Enter part number", 2, 0, 2),
-            ("Supplier Section", "Enter supplier details", 3, 0, 2),
-            ("Model & Part Name", "Enter model & part name", 4, 0, 2),
-            ("Image File Path", "No image selected", 5, 0, 2),
-            ("ALC Code", "Enter ALC code", 6, 0),
+            ("Vendor Code", self.PLACEHOLDERS["Vendor Code"], 0, 0),
+            ("EO Number", self.PLACEHOLDERS["EO Number"], 0, 1),
+            ("Special Data", self.PLACEHOLDERS["Special Data"], 1, 0),
+            ("Initial ID", self.PLACEHOLDERS["Initial ID"], 1, 1),
+            ("Part Number", self.PLACEHOLDERS["Part Number"], 2, 0, 2),
+            ("Supplier Section", self.PLACEHOLDERS["Supplier Section"], 3, 0, 2),
+            ("Model & Part Name", self.PLACEHOLDERS["Model & Part Name"], 4, 0, 2),
+            ("Image File Path", self.PLACEHOLDERS["Image File Path"], 5, 0, 2),
+            ("ALC Code", self.PLACEHOLDERS["ALC Code"], 6, 0),
             ("PLC Address", plc_options, 7, 0),  # Using loaded PLC options
             ("Barcode Type", barcode_options, 7, 1),  # Using loaded barcode options
         ]
@@ -425,7 +457,9 @@ class WorkspaceApp:
                 elif label_text == "Barcode Type":
                     combo.bind('<<ComboboxSelected>>', self.on_barcode_type_select)
             else:  # Create regular entry
-                entry = tk.Entry(left_frame, width=20)
+                # Padded, so the text isn't against the edge and the box
+                # stands as tall as the comboboxes in the same panel
+                entry = ui.PaddedEntry(left_frame, width=20)
                 entry.insert(0, placeholder)
                 entry.config(fg='gray')
                 entry.grid(row=row, column=col, columnspan=colspan, sticky='ew', padx=5, pady=5)
@@ -487,6 +521,18 @@ class WorkspaceApp:
                 btn.config(command=self.edit_record)
 
             self.action_buttons[text] = btn
+
+    def entry_value(self, key):
+        """What was typed in a part detail box, or "" while it shows its placeholder."""
+        text = self.textboxes[key].get().strip()
+        return "" if text == self.PLACEHOLDERS.get(key) else text
+
+    def show_placeholder(self, key):
+        """Empty a part detail box and show its placeholder in grey."""
+        entry = self.textboxes[key]
+        entry.delete(0, tk.END)
+        entry.insert(0, self.PLACEHOLDERS[key])
+        entry.config(fg='gray')
 
     def on_entry_focus_in(self, event, entry, placeholder):
         """Handle entry field focus in - remove placeholder text"""
@@ -1286,9 +1332,8 @@ class WorkspaceApp:
             ]
             
             # Check if required fields are filled
-            empty_fields = [field for field in required_fields 
-                           if not self.textboxes[field].get() or 
-                           self.textboxes[field].get() == f"Enter {field.lower()}"]
+            empty_fields = [field for field in required_fields
+                            if not self.entry_value(field)]
             
             if empty_fields:
                 messagebox.showwarning(
@@ -1301,7 +1346,7 @@ class WorkspaceApp:
             image_path = self.textboxes["Image File Path"].get()
             
             # Check if image path is empty or placeholder
-            if not image_path or image_path == "No image selected":
+            if not image_path or image_path == self.PLACEHOLDERS["Image File Path"]:
                 messagebox.showwarning(
                     "Image Required", 
                     "Please upload an image before saving the part!\n\n" +
@@ -1325,9 +1370,9 @@ class WorkspaceApp:
                 return
             
             # Collect other data
-            part_number = self.textboxes["Part Number"].get()
-            model_name = self.textboxes["Model & Part Name"].get()
-            alc_code = self.textboxes["ALC Code"].get().strip()
+            part_number = self.entry_value("Part Number")
+            model_name = self.entry_value("Model & Part Name")
+            alc_code = self.entry_value("ALC Code")
             
             # Enhanced duplicate check and edit mode validation
             conn = mysql.connector.connect(**self.db_config)
@@ -1391,15 +1436,13 @@ class WorkspaceApp:
             barcode_type = self.second_quad_combos.get("Barcode Type", ttk.Combobox()).get()
             
             # Get supplier section from textboxes
-            supplier_section = self.textboxes.get("Supplier Section", tk.Entry()).get()
-            if supplier_section == "Enter supplier details":
-                supplier_section = ""
-            
+            supplier_section = self.entry_value("Supplier Section")
+
             # Collect other data
-            vendor_code = self.textboxes["Vendor Code"].get()
-            eo_number = self.textboxes["EO Number"].get()
-            special_data = self.textboxes["Special Data"].get()
-            initial_id = self.textboxes["Initial ID"].get()
+            vendor_code = self.entry_value("Vendor Code")
+            eo_number = self.entry_value("EO Number")
+            special_data = self.entry_value("Special Data")
+            initial_id = self.entry_value("Initial ID")
             image_path = self.textboxes["Image File Path"].get()
             
             master_data = (
@@ -1763,18 +1806,9 @@ class WorkspaceApp:
             entry.config(state='normal', bg=ui.SURFACE)
             entry.delete(0, 'end')
             
-            # Set appropriate placeholder based on field
-            if key == "Part Number":
-                entry.insert(0, "Enter part number")
-            elif key == "Model & Part Name":
-                entry.insert(0, "Enter model & part name")
-            elif key == "Image File Path":
-                entry.insert(0, "No image selected")
+            self.show_placeholder(key)
+            if key == "Image File Path":
                 entry.config(state='readonly')
-            else:
-                entry.insert(0, f"Enter {key.lower()}")
-            
-            entry.config(fg='gray')
         
         # Clear image
         if self.image_label:
@@ -2065,10 +2099,13 @@ class WorkspaceApp:
                         self.textboxes[key].insert(0, value)
                         self.textboxes[key].config(fg='black')
                     else:
-                        self.textboxes[key].insert(0, f"Enter {key.lower()}")
-                        self.textboxes[key].config(fg='gray')
-                    # Make readonly in view mode with light gray background
-                    self.textboxes[key].config(state='readonly', bg='#f5f5f5')
+                        self.show_placeholder(key)
+                    # Make readonly in view mode with light gray background.
+                    # The text colour goes with it: given a background alone,
+                    # the palette picks a dark one, and an empty field's
+                    # placeholder then reads like a value.
+                    self.textboxes[key].config(state='readonly', bg='#f5f5f5',
+                                               fg='black' if value else 'gray')
                 
                 # Set combobox values and make readonly
                 plc_addr = record.get('MM_PLC_ADDRESS', '')
@@ -2242,18 +2279,9 @@ class WorkspaceApp:
             entry.config(state='normal')  # Enable all fields
             entry.delete(0, 'end')
             
-            # Set appropriate placeholder based on field
-            if key == "Part Number":
-                entry.insert(0, "Enter part number")
-            elif key == "Model & Part Name":
-                entry.insert(0, "Enter model name")
-            elif key == "Image File Path":
-                entry.insert(0, "No image selected")
+            self.show_placeholder(key)
+            if key == "Image File Path":
                 entry.config(state='readonly')
-            else:
-                entry.insert(0, f"Enter {key.lower()}")
-            
-            entry.config(fg='gray')
         
         # Enable and clear comboboxes
         for combo in self.second_quad_combos.values():
@@ -2482,7 +2510,7 @@ class WorkspaceApp:
                 print(f"Part Number field locked: {entry.get()}")
             elif key != "Image File Path":  # Keep Image File Path readonly
                 entry.config(state='normal', bg=ui.SURFACE)
-                if entry.get() in ["Enter " + key.lower(), "No image selected"]:
+                if entry.get() == self.PLACEHOLDERS[key]:
                     entry.delete(0, tk.END)
                 entry.config(fg='black')
         
