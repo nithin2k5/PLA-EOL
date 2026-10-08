@@ -278,20 +278,25 @@ class MainConsole(tk.Tk):
             ('btn_contact', 'mail', "Contact", self.support_click),
         )
 
+        # The entries share the rail's height equally, so it is filled top to
+        # bottom rather than bunched at the top with a gap above Exit.
         self.nav_buttons = []
         for row, (attribute, icon, label, command) in enumerate(entries, start=1):
+            nav.grid_rowconfigure(row, weight=1, uniform='nav')
             button = self.nav_button(nav, icon, label, command)
-            button.grid(row=row, column=0, sticky="ew", padx=6, pady=(6, 0))
+            button.grid(row=row, column=0, sticky="nsew", padx=6, pady=(6, 0))
             setattr(self, attribute, button)
 
-        # Exit sits apart at the foot of the rail, so it is never clicked by
-        # someone reaching for the console above it.
-        gap = len(entries) + 1
-        nav.grid_rowconfigure(gap, weight=1)
+        # Exit sits apart at the foot of the rail, below a rule, so it is
+        # never clicked by someone reaching for the console above it.
+        rule = len(entries) + 1
+        tk.Frame(nav, bg=NavButton.DISABLED_INK, height=1).grid(
+            row=rule, column=0, sticky="ew", padx=ui.PAD_LARGE, pady=(ui.PAD_LARGE, 0))
 
+        nav.grid_rowconfigure(rule + 1, weight=1, uniform='nav')
         self.btn_exit = self.nav_button(nav, 'power', "Exit", self.exit_click,
                                         danger=True)
-        self.btn_exit.grid(row=gap + 1, column=0, sticky="ew", padx=6, pady=6)
+        self.btn_exit.grid(row=rule + 1, column=0, sticky="nsew", padx=6, pady=6)
 
         return nav
 
