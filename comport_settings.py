@@ -16,20 +16,32 @@ from plc_address import bit_address
 import json
 from datetime import datetime
 
+class DeviceRow:
+    """One row of the device table: its widgets and the device it drives."""
+
+
 class ComPortSettings:
     # The machine carries four loadcells and two barcode cameras.
     LOADCELL_COUNT = 4
     CAMERA_COUNT = 2
     BAUD_RATES = [9600, 19200, 38400, 57600, 115200]
 
+    # Device table columns: heading and minimum width. The last one takes
+    # whatever width is left over.
+    COLUMNS = (("Device", 200), ("COM Port", 170), ("Baud Rate", 150),
+               ("Station ID", 120), ("Action", 230), ("Status", 0))
+
     def __init__(self, root):
         self.root = root
         ui.apply(root)
-        
+
         # Initialize lists and dictionaries at the start
-        self.all_comboboxes = []  # Move this to the top
-        self.loadcell_ports = {}  # Move this here too
+        self.all_comboboxes = []  # every COM port and baud rate box
+        self.all_entries = []     # every typed setting, frozen with the boxes
+        self.loadcell_ports = {}  # loadcell row -> open serial port
+        self.loadcell_rows = []
         self.modbus_client = None
+        self.modbus_tcp_client = None
 
         # LVDT stream
         self.lvdt_port = None
@@ -38,33 +50,27 @@ class ComPortSettings:
 
         # Camera combos, keyed by camera number
         self.camera_combos = {}
-        
+
         # Get machine ID from environment variable
         self.machine_id = config.get('MACHINE_ID', 'Not Set')
-        
+
         # Set title with machine ID
         title = "COM Port Settings"
         if self.machine_id and self.machine_id != 'Not Set':
             title += f" - Machine ID: {self.machine_id}"
         self.root.title(title)
-        
+
         # Make it full screen
         self.root.state('zoomed')
-        
+
         # Configure the main background color
         self.root.configure(bg=ui.APP_BG)
-        
+
         # Create and setup the UI
         self.setup_ui()
-        
+
         # Settings are read through config.py, which creates .config on demand.
         config.reload()
-
-        # Add Modbus client attribute
-        self.modbus_client = None
-
-        # Initialize loadcell serial ports dictionary
-        self.loadcell_ports = {}
 
         # Recent loadcell readings, kept for this session only
         self.loadcell_data = {}
@@ -76,210 +82,252 @@ class ComPortSettings:
         self.load_saved_settings()
         self.load_device_values()
 
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
     def setup_ui(self):
         # The pink title bar every console carries
         ui.page_header(self.root, "COM Port Settings")
 
-        # Main content frame
-        main_frame = tk.Frame(self.root, bg='#f0f0f0')
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        body = tk.Frame(self.root, bg=ui.APP_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(12, 20))
 
-        # Control buttons frame
-        control_frame = tk.Frame(main_frame, bg='#f0f0f0')
-        control_frame.pack(side=tk.RIGHT, padx=20)
-        
-        # Control buttons with commands
-        self.buttons = {
-            "EDIT": {'bg': '#3498db', 'fg': 'white', 'command': self.enable_editing},
-            "SAVE": {'bg': '#2ecc71', 'fg': 'white', 'command': self.save_settings},
-            "RESET": {'bg': '#e74c3c', 'fg': 'white', 'command': self.reset_settings}
-        }
-        
-        # Create buttons
+        self.available_ports = [port.device for port in serial.tools.list_ports.comports()]
+
+        # Heading line, with the EDIT / SAVE / RESET controls on the right
+        top = tk.Frame(body, bg=ui.APP_BG)
+        top.pack(fill='x', pady=(0, 8))
+        tk.Label(top, text="Device Ports", bg=ui.APP_BG, fg=ui.ACCENT,
+                 font=ui.FONT_SECTION).pack(side='left')
+
         self.control_buttons = {}
-        for text, props in self.buttons.items():
-            btn = tk.Button(
-                control_frame, 
-                text=text, 
-                bg=props['bg'], 
-                fg=props['fg'],
-                width=15, 
-                font=(ui.FONT_FAMILY, 12, 'bold'),
-                command=props['command']
-            )
-            btn.pack(pady=5)
+        # Packed from the right, so they read EDIT, SAVE, RESET
+        for text, bg, command in (("RESET", ui.DANGER, self.reset_settings),
+                                  ("SAVE", ui.SUCCESS, self.save_settings),
+                                  ("EDIT", ui.ACCENT_FILL, self.enable_editing)):
+            btn = self.action_button(top, text, command, bg=bg, width=10)
+            btn.pack(side='right', padx=(6, 0))
             self.control_buttons[text] = btn
 
         # Initially enable Save button and disable Edit button
         self.control_buttons["SAVE"].config(state="normal")
         self.control_buttons["EDIT"].config(state="disabled")
 
-        # Nine panels are taller than a short screen, so they scroll.
-        scroller = ui.scrollable(main_frame)
-        scroller.pack(fill=tk.BOTH, expand=True)
-        self.panel_scroller = scroller
-        panels_frame = scroller.body
-        
-        # Configure grid columns to have equal width
-        panels_frame.grid_columnconfigure(0, weight=1)
-        panels_frame.grid_columnconfigure(1, weight=1)
-        panels_frame.grid_columnconfigure(2, weight=1)
+        self.create_device_table(body)
+        self.create_options(body)
+        self.create_log(body)
 
-        # PLC Section
-        plc_frame = self.create_section(
-            panels_frame, "PLC", ui.SURFACE,
-            width=400, height=400
-        )
-        plc_frame.grid(row=0, column=0, padx=10, pady=10, sticky='nsew')
-        self.add_plc_content(plc_frame)
+        # The Rx text the tests write to is the one shared log
+        self.rx_text = self.log_text
+        self.rx_tcp_text = self.log_text
 
-        # Sections are laid out three to a row, starting beside the PLC panel.
-        position = 1
+    def action_button(self, parent, text, command, bg=ui.ACCENT_FILL, width=9):
+        """A flat button in one of the palette's colours."""
+        return tk.Button(parent, text=text, command=command, bg=bg,
+                         fg=ui.readable_on(bg), activebackground=bg,
+                         relief='flat', bd=0, width=width, cursor='hand2',
+                         font=(ui.FONT_FAMILY, 10, 'bold'), padx=4, pady=3)
 
-        # Loadcell Sections
-        for i in range(1, self.LOADCELL_COUNT + 1):
-            loadcell_frame = self.create_section(
-                panels_frame, f"LOADCELL - {i:02d} (L{i})", ui.SURFACE,
-                width=400, height=400
-            )
-            loadcell_frame.grid(row=position // 3, column=position % 3,
-                                padx=10, pady=10, sticky='nsew')
-            self.add_loadcell_content(loadcell_frame)
-            position += 1
-
-        # LVDT Section
-        lvdt_frame = self.create_section(
-            panels_frame, "LVDT", ui.SURFACE,
-            width=400, height=400
-        )
-        lvdt_frame.grid(row=position // 3, column=position % 3,
-                        padx=10, pady=10, sticky='nsew')
-        self.add_lvdt_content(lvdt_frame)
-        position += 1
-
-        # Camera Sections
-        for i in range(1, self.CAMERA_COUNT + 1):
-            camera_frame = self.create_section(
-                panels_frame, f"CAMERA - {i:02d}", ui.SURFACE,
-                width=400, height=400
-            )
-            camera_frame.grid(row=position // 3, column=position % 3,
-                              padx=10, pady=10, sticky='nsew')
-            self.add_camera_content(camera_frame, i)
-            position += 1
-
-        # Modbus TCP Section
-        modbus_tcp_frame = self.create_section(
-            panels_frame, "MODBUS TCP", ui.SURFACE,
-            width=400, height=400
-        )
-        modbus_tcp_frame.grid(row=position // 3, column=position % 3,
-                              padx=10, pady=10, sticky='nsew')
-        self.add_modbus_tcp_content(modbus_tcp_frame)
-
-    def create_section(self, parent, title, bg_color, width, height):
-        frame = tk.Frame(parent, bg=bg_color, width=width,
+    def create_device_table(self, parent):
+        """One row per serial device: port, baud rate, station ID and its tests."""
+        table = tk.Frame(parent, bg=ui.SURFACE,
                          highlightbackground=ui.BORDER, highlightthickness=1)
-        # Height follows the content; a fixed one clipped the lower rows.
-        frame.pack_propagate(False)
-        frame.configure(height=height)
-        
-        # Section caption: a navy band, like the Test console's part header
-        tk.Label(frame, text=title, bg=ui.NAVY, fg=ui.TEXT_ON_DARK,
-                 font=ui.FONT_SECTION, anchor='w',
-                 padx=ui.PAD, pady=ui.PAD).pack(fill='x')
-        
-        return frame
+        table.pack(fill='x')
+        self.table = table
+        self._row_index = 0
 
-    def add_plc_content(self, frame):
-        # Test button and Station ID
-        top_frame = tk.Frame(frame, bg=frame['bg'])
-        top_frame.pack(fill='x', padx=5, pady=5)
-        
-        # Buttons frame for TEST and READ buttons side by side
-        buttons_frame = tk.Frame(top_frame, bg=frame['bg'])
-        buttons_frame.pack(side='left', padx=2)
-        
-        # Test Button
-        self.test_button = tk.Button(buttons_frame, text="TEST", bg=ui.ACCENT_FILL, fg='white', 
-                              width=8, font=(ui.FONT_FAMILY, 9, 'bold'),
-                                    command=self.read_plc_data)
-        self.test_button.pack(side='left', padx=2)
-        
-        # Read Button (new)
-        self.read_button = tk.Button(buttons_frame, text="READ", bg='navy', fg='white',
-                              width=8, font=(ui.FONT_FAMILY, 9, 'bold'),
-                                    command=self.read_holding_registers)
-        self.read_button.pack(side='left', padx=2)
-        
-        # Station ID
-        station_frame = tk.Frame(top_frame, bg=frame['bg'])
-        station_frame.pack(side='left', padx=5)
-        self.station_id_entry = tk.Entry(station_frame, width=10)
+        for column, (heading, width) in enumerate(self.COLUMNS):
+            table.grid_columnconfigure(column, minsize=width,
+                                       weight=0 if width else 1)
+            tk.Label(table, text=heading, bg=ui.NAVY, fg=ui.TEXT_ON_DARK,
+                     font=ui.FONT_BODY_BOLD, anchor='w', padx=12, pady=8).grid(
+                         row=0, column=column, sticky='nsew')
+
+        self.add_plc_row()
+        for i in range(1, self.LOADCELL_COUNT + 1):
+            self.add_loadcell_row(i)
+        self.add_lvdt_row()
+        for i in range(1, self.CAMERA_COUNT + 1):
+            self.add_camera_row(i)
+
+    def add_row(self, device):
+        """Start a table row, returning one cell frame per column."""
+        self._row_index += 1
+        bg = ui.SURFACE if self._row_index % 2 else ui.APP_BG
+        cells = []
+        for column in range(len(self.COLUMNS)):
+            cell = tk.Frame(self.table, bg=bg)
+            cell.grid(row=self._row_index, column=column, sticky='nsew')
+            cells.append(cell)
+        tk.Label(cells[0], text=device, bg=bg, fg=ui.TEXT, font=ui.FONT_BODY,
+                 anchor='w').pack(side='left', padx=12, pady=7)
+        return cells
+
+    def blank_cell(self, cell):
+        """Mark a column that doesn't apply to the device."""
+        tk.Label(cell, text="-", bg=cell['bg'], fg=ui.TEXT_MUTED,
+                 font=ui.FONT_BODY).pack(side='left', padx=14)
+
+    def port_combos(self, cells):
+        """The COM port and baud rate boxes, in the row's second and third cells."""
+        com_combo = ttk.Combobox(cells[1], width=14, state="readonly",
+                                 values=self.available_ports or [""])
+        com_combo.pack(side='left', padx=12, pady=7)
+        baud_combo = ttk.Combobox(cells[2], width=11, state="readonly",
+                                  values=self.BAUD_RATES)
+        baud_combo.pack(side='left', padx=12, pady=7)
+        self.all_comboboxes.extend([com_combo, baud_combo])
+        return com_combo, baud_combo
+
+    def status_label(self, cell, text=""):
+        label = tk.Label(cell, text=text, bg=cell['bg'], fg=ui.TEXT_MUTED,
+                         font=ui.FONT_SMALL, anchor='w')
+        label.pack(side='left', padx=12)
+        return label
+
+    def add_plc_row(self):
+        cells = self.add_row("PLC")
+        self.plc_com_combo, self.plc_baud_combo = self.port_combos(cells)
+
+        self.station_id_entry = tk.Entry(cells[3], width=8, justify='center')
         # A station id is a plain number, so reject anything else as it is typed.
         digits_only = self.station_id_entry.register(
             lambda proposed: proposed == '' or proposed.isdigit())
         self.station_id_entry.configure(validate='key', validatecommand=(digits_only, '%P'))
-        self.station_id_entry.pack(side='left', padx=2)
-        tk.Label(station_frame, text="Station ID", bg=frame['bg']).pack(side='left')
-        
-        # Register Address (new)
-        reg_frame = tk.Frame(frame, bg=frame['bg'])
-        reg_frame.pack(anchor='w', padx=5, pady=5)
-        tk.Label(reg_frame, text="Register Address (e.g., D0001):", bg=frame['bg']).pack(side='left')
-        self.reg_address_entry = tk.Entry(reg_frame, width=15)
-        self.reg_address_entry.pack(side='left', padx=5)
-        
-        # Number of Points to Read (new)
-        points_frame = tk.Frame(frame, bg=frame['bg'])
-        points_frame.pack(anchor='w', padx=5, pady=5)
-        tk.Label(points_frame, text="Number of Points to Read:", bg=frame['bg']).pack(side='left')
-        self.points_entry = tk.Entry(points_frame, width=5)
-        self.points_entry.pack(side='left', padx=5)
-        self.points_entry.insert(0, "1")  # Default to 1 point
-        
-        # Style the labels and comboboxes
-        label_style = {'bg': frame['bg'], 'fg': 'black', 'font': (ui.FONT_FAMILY, 10)}
-        
-        # COM Port
-        tk.Label(frame, text="COM Port", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.plc_com_combo = ttk.Combobox(frame, width=25, state="readonly")
-        self.plc_com_combo.pack(anchor='w', padx=5)
-        
-        # BAUD Rate
-        tk.Label(frame, text="BAUD Rate", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.plc_baud_combo = ttk.Combobox(frame, width=25, state="readonly")
-        self.plc_baud_combo.pack(anchor='w', padx=5)
-        
-        # Get available COM ports
-        available_ports = [port.device for port in serial.tools.list_ports.comports()]
-        
-        # Update combobox values with empty default
-        self.plc_com_combo['values'] = available_ports if available_ports else [""]
-        self.plc_com_combo.set("")  # Empty default
-        self.plc_baud_combo['values'] = [9600, 19200, 38400, 57600, 115200]
-        self.plc_baud_combo.set("")  # Empty default
-        
-        # Initially enable all inputs
-        self.plc_com_combo.config(state="readonly")
-        self.plc_baud_combo.config(state="readonly")
-        self.station_id_entry.config(state="normal")
-        self.reg_address_entry.config(state="normal")
-        self.points_entry.config(state="normal")
-        
-        # Connect Button
-        self.connect_button = tk.Button(frame, text="Connect", bg='green', fg='white',
-                                      font=(ui.FONT_FAMILY, 9, 'bold'), command=self.connect_to_plc)
-        self.connect_button.pack(anchor='w', padx=5, pady=5)
-        
-        # Rx String
-        tk.Label(frame, text="Rx String", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.rx_text = tk.Text(frame, height=10, width=30, font=('Consolas', 10))
-        self.rx_text.pack(padx=5, pady=5)
-        
-        # Initially disable test and read buttons
+        self.station_id_entry.pack(side='left', padx=12, pady=7)
+        self.all_entries.append(self.station_id_entry)
+
+        self.connect_button = self.action_button(cells[4], "CONNECT", self.connect_to_plc,
+                                                 bg=ui.SUCCESS)
+        self.connect_button.pack(side='left', padx=(12, 4))
+        self.test_button = self.action_button(cells[4], "TEST", self.read_plc_data)
+        self.test_button.pack(side='left', padx=4)
+
+        self.plc_status = self.status_label(cells[5], "Not connected")
+
+        # Initially disable test button
         self.test_button.config(state="disabled")
+
+    def add_loadcell_row(self, number):
+        row = DeviceRow()
+        row.loadcell_num = f"{number:02d}"
+        cells = self.add_row(f"Loadcell {row.loadcell_num} (L{number})")
+        row.com_combo, row.baud_combo = self.port_combos(cells)
+        self.blank_cell(cells[3])
+
+        connect_button = self.action_button(
+            cells[4], "CONNECT", bg=ui.SUCCESS,
+            command=lambda: self.connect_loadcell(row, row.com_combo, row.baud_combo,
+                                                  row.test_button))
+        connect_button.pack(side='left', padx=(12, 4))
+        row.test_button = self.action_button(cells[4], "TEST",
+                                             lambda: self.test_loadcell(row))
+        row.test_button.pack(side='left', padx=4)
+        # Initially disable test button
+        row.test_button.config(state="disabled")
+
+        row.status = self.status_label(cells[5], "Not connected")
+        self.loadcell_rows.append(row)
+
+    def add_lvdt_row(self):
+        """Port, baud, connect and the four live readings the LVDT streams."""
+        cells = self.add_row("LVDT")
+        self.lvdt_com_combo, self.lvdt_baud_combo = self.port_combos(cells)
+        self.blank_cell(cells[3])
+
+        self.lvdt_connect_button = self.action_button(cells[4], "CONNECT", self.connect_lvdt,
+                                                      bg=ui.SUCCESS)
+        self.lvdt_connect_button.pack(side='left', padx=(12, 4))
+        self.lvdt_stop_button = self.action_button(cells[4], "STOP", self.disconnect_lvdt,
+                                                   bg=ui.DANGER)
+        self.lvdt_stop_button.config(state='disabled')
+        self.lvdt_stop_button.pack(side='left', padx=4)
+
+        self.lvdt_value_entries = {}
+        for name in ('P01', 'P02', 'P03', 'P04'):
+            tk.Label(cells[5], text=f"{name}:", bg=cells[5]['bg'], fg=ui.TEXT,
+                     font=(ui.FONT_FAMILY, 10, 'bold')).pack(side='left', padx=(12, 2))
+            entry = tk.Entry(cells[5], width=7, justify='center', state='readonly')
+            entry.pack(side='left')
+            self.lvdt_value_entries[name] = entry
+
+        self.lvdt_status_label = self.status_label(cells[5], "Not connected")
+
+    def add_camera_row(self, camera_num):
+        """A camera only needs the port and baud rate it is wired on."""
+        cells = self.add_row(f"Camera {camera_num:02d}")
+        self.camera_combos[camera_num] = self.port_combos(cells)
+        self.blank_cell(cells[3])
+        self.blank_cell(cells[4])
+
+    def create_options(self, parent):
+        """The PLC register read and the Modbus TCP link, under the table."""
+        box = tk.Frame(parent, bg=ui.SURFACE,
+                       highlightbackground=ui.BORDER, highlightthickness=1)
+        box.pack(fill='x', pady=(10, 0))
+
+        def caption(row, text):
+            tk.Label(box, text=text, bg=ui.SURFACE, fg=ui.TEXT, font=ui.FONT_BODY_BOLD,
+                     anchor='w', width=16).grid(row=row, column=0, sticky='w',
+                                               padx=12, pady=7)
+
+        def field(row, column, text, width):
+            tk.Label(box, text=text, bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                     font=ui.FONT_SMALL).grid(row=row, column=column, sticky='e',
+                                              padx=(12, 4))
+            entry = tk.Entry(box, width=width)
+            entry.grid(row=row, column=column + 1, sticky='w')
+            self.all_entries.append(entry)
+            return entry
+
+        # PLC register read
+        caption(0, "PLC Register Read")
+        self.reg_address_entry = field(0, 1, "Address (e.g. D0001)", 15)
+        self.points_entry = field(0, 3, "Points", 6)
+        self.points_entry.insert(0, "1")  # Default to 1 point
+        self.read_button = self.action_button(box, "READ", self.read_holding_registers)
+        self.read_button.grid(row=0, column=5, sticky='w', padx=(12, 4))
+        # Initially disable read button
         self.read_button.config(state="disabled")
+
+        # Modbus TCP
+        caption(1, "Modbus TCP")
+        self.ip_entry = field(1, 1, "IP Address", 15)
+        self.port_entry = field(1, 3, "Port", 6)
+        actions = tk.Frame(box, bg=ui.SURFACE)
+        actions.grid(row=1, column=5, sticky='w', padx=(12, 0))
+        self.connect_tcp_button = self.action_button(actions, "CONNECT",
+                                                     self.connect_to_modbus_tcp, bg=ui.SUCCESS)
+        self.connect_tcp_button.pack(side='left', padx=(0, 4))
+        self.test_tcp_button = self.action_button(actions, "TEST", self.read_modbus_tcp_data)
+        self.test_tcp_button.pack(side='left', padx=4)
+        # Initially disable test button
+        self.test_tcp_button.config(state="disabled")
+        self.tcp_status = tk.Label(box, text="Not connected", bg=ui.SURFACE,
+                                   fg=ui.TEXT_MUTED, font=ui.FONT_SMALL)
+        self.tcp_status.grid(row=1, column=6, sticky='w', padx=12)
+
+    def create_log(self, parent):
+        """What the devices sent back, for every test on the page."""
+        box = tk.Frame(parent, bg=ui.SURFACE,
+                       highlightbackground=ui.BORDER, highlightthickness=1)
+        box.pack(fill='both', expand=True, pady=(10, 0))
+
+        caption = tk.Frame(box, bg=ui.SUBTLE)
+        caption.pack(fill='x')
+        tk.Label(caption, text="Rx String", bg=ui.SUBTLE, fg=ui.TEXT,
+                 font=ui.FONT_BODY_BOLD, padx=12, pady=5).pack(side='left')
+        self.action_button(caption, "CLEAR", lambda: self.log_text.delete("1.0", tk.END),
+                           bg=ui.SILVER, width=8).pack(side='right', padx=6, pady=3)
+
+        scrollbar = ttk.Scrollbar(box, orient='vertical')
+        scrollbar.pack(side='right', fill='y')
+        self.log_text = tk.Text(box, height=6, font=('Consolas', 10), bd=0,
+                                bg=ui.SURFACE, fg=ui.TEXT, padx=10, pady=6,
+                                yscrollcommand=scrollbar.set)
+        self.log_text.pack(fill='both', expand=True)
+        scrollbar.config(command=self.log_text.yview)
 
     def connect_to_plc(self):
         """Connect to PLC using Modbus RTU"""
@@ -308,6 +356,7 @@ class ComPortSettings:
                         messagebox.showinfo("Connection Status", "Already connected to PLC!")
                         self.test_button.config(state="normal")
                         self.read_button.config(state="normal")
+                        self.plc_status.config(text=f"Connected on {port}", fg=ui.SUCCESS)
                         return True
                 except:
                     # If test fails, close the existing connection
@@ -342,6 +391,7 @@ class ComPortSettings:
                             messagebox.showinfo("Connection Status", "Connected to PLC!")
                             self.test_button.config(state="normal")
                             self.read_button.config(state="normal")
+                            self.plc_status.config(text=f"Connected on {port}", fg=ui.SUCCESS)
                             return True
                     
                     if attempt < max_retries - 1:
@@ -495,84 +545,6 @@ class ComPortSettings:
             except Exception as e:
                 self.rx_text.insert(tk.END, f"{address} --> Error: {str(e)}\n")
 
-    def add_loadcell_content(self, frame):
-        # Style settings
-        label_style = {'bg': frame['bg'], 'fg': 'black', 'font': (ui.FONT_FAMILY, 10)}
-        
-        # Test button with consistent styling
-        test_button = tk.Button(
-            frame, 
-            text="TEST", 
-            bg=ui.ACCENT_FILL, 
-            fg='white', 
-            width=8, 
-            font=(ui.FONT_FAMILY, 9, 'bold'),
-            command=lambda f=frame: self.test_loadcell(f)
-        )
-        test_button.pack(anchor='w', padx=5, pady=5)
-        
-        # COM Port
-        tk.Label(frame, text="COM Port", **label_style).pack(anchor='w', padx=5, pady=2)
-        com_combo = ttk.Combobox(frame, width=25, state="readonly")
-        com_combo.pack(anchor='w', padx=5)
-        
-        # BAUD Rate
-        tk.Label(frame, text="BAUD Rate", **label_style).pack(anchor='w', padx=5, pady=2)
-        baud_combo = ttk.Combobox(frame, width=25, state="readonly")
-        baud_combo['values'] = [9600, 19200, 38400, 57600, 115200]
-        baud_combo.set("")  # Empty default
-        baud_combo.pack(anchor='w', padx=5)
-        
-        # Add comboboxes to the list
-        self.all_comboboxes.extend([com_combo, baud_combo])
-        
-        # Get available COM ports
-        available_ports = [port.device for port in serial.tools.list_ports.comports()]
-        
-        # Get loadcell number and store it
-        loadcell_num = frame.winfo_children()[0].cget("text").split('-')[1].strip()[:2]
-        frame.loadcell_num = loadcell_num
-        
-        # Update combobox values with empty default
-        if available_ports:
-            com_combo['values'] = available_ports
-            com_combo.set("")  # Empty default
-        else:
-            com_combo['values'] = [""]
-            com_combo.set("")
-        
-        baud_combo['values'] = [9600, 19200, 38400, 57600, 115200]
-        baud_combo.set("")  # Empty default
-        
-        # Initially enable all inputs
-        com_combo.config(state="readonly")
-        baud_combo.config(state="readonly")
-        
-        # Connect Button
-        connect_button = tk.Button(
-            frame, 
-            text="Connect", 
-            bg='green', 
-            fg='white',
-            font=(ui.FONT_FAMILY, 9, 'bold'),
-            command=lambda: self.connect_loadcell(frame, com_combo, baud_combo, test_button)
-        )
-        connect_button.pack(anchor='w', padx=5, pady=5)
-        
-        # Rx String
-        tk.Label(frame, text="Rx String", **label_style).pack(anchor='w', padx=5, pady=2)
-        rx_text = tk.Text(frame, height=8, width=25, font=('Consolas', 10))
-        rx_text.pack(padx=5, pady=5)
-        
-        # Store the rx_text widget reference
-        frame.rx_text = rx_text
-        
-        # Initially disable test button
-        test_button.config(state="disabled")
-        
-        # Store the test button reference
-        frame.test_button = test_button
-
     def test_loadcell(self, frame):
         """Test loadcell communication and save data"""
         try:
@@ -582,7 +554,7 @@ class ComPortSettings:
                                    f"Loadcell {loadcell_num} is not connected!")
                 return
             
-            frame.rx_text.delete("1.0", tk.END)
+            self.log_text.delete("1.0", tk.END)
             loadcell_num = frame.loadcell_num
             
             try:
@@ -596,7 +568,7 @@ class ComPortSettings:
                 # Send command
                 command = f"ID{loadcell_num}P".encode()
                 self.loadcell_ports[frame].write(command)
-                frame.rx_text.insert(tk.END, f"Sent command: ID{loadcell_num}P\n")
+                self.log_text.insert(tk.END, f"Sent command: ID{loadcell_num}P\n")
                 
                 # Update GUI
                 self.root.update()
@@ -606,25 +578,25 @@ class ComPortSettings:
                 
                 if response:
                     decoded_response = response.decode('utf-8', errors='replace').strip()
-                    frame.rx_text.insert(tk.END, f"Response: {decoded_response}\n")
+                    self.log_text.insert(tk.END, f"Response: {decoded_response}\n")
                     
                     # Parse and save data
                     try:
                         parts = decoded_response.split(',')
                         if len(parts) > 1:
                             value = parts[1]
-                            frame.rx_text.insert(tk.END, f"Parsed value: {value}\n")
+                            self.log_text.insert(tk.END, f"Parsed value: {value}\n")
                             
                             # Save to environment variable
                             self.save_loadcell_data(loadcell_num, value)
                             
                     except IndexError:
-                        frame.rx_text.insert(tk.END, "Could not parse value\n")
+                        self.log_text.insert(tk.END, "Could not parse value\n")
                 else:
-                    frame.rx_text.insert(tk.END, "No response received\n")
+                    self.log_text.insert(tk.END, "No response received\n")
                     
             except Exception as e:
-                frame.rx_text.insert(tk.END, f"Communication error: {str(e)}\n")
+                self.log_text.insert(tk.END, f"Communication error: {str(e)}\n")
                 
             finally:
                 self.loadcell_ports[frame].timeout = 1
@@ -633,7 +605,7 @@ class ComPortSettings:
             self.save_device_values()
             
         except Exception as e:
-            frame.rx_text.insert(tk.END, f"Error: {str(e)}\n")
+            self.log_text.insert(tk.END, f"Error: {str(e)}\n")
         
         self.root.update()
 
@@ -675,6 +647,7 @@ class ComPortSettings:
             if ser.is_open:
                 self.loadcell_ports[frame] = ser
                 test_button.config(state="normal")
+                frame.status.config(text=f"Connected on {port}", fg=ui.SUCCESS)
                 messagebox.showinfo("Success", f"Connected to Loadcell {loadcell_num}")
             else:
                 raise serial.SerialException("Failed to open port")
@@ -685,59 +658,6 @@ class ComPortSettings:
             messagebox.showerror("Error", f"Serial port error: {str(se)}")
         except Exception as e:
             messagebox.showerror("Error", f"Unexpected error: {str(e)}")
-
-    def add_lvdt_content(self, frame):
-        """Build the LVDT panel: port, baud, connect and the four live readings."""
-        label_style = {'bg': frame['bg'], 'fg': 'black', 'font': (ui.FONT_FAMILY, 10)}
-
-        top_frame = tk.Frame(frame, bg=frame['bg'])
-        top_frame.pack(fill='x', padx=5, pady=5)
-
-        self.lvdt_connect_button = tk.Button(
-            top_frame, text="CONNECT", bg='navy', fg='white',
-            width=10, font=(ui.FONT_FAMILY, 9, 'bold'),
-            command=self.connect_lvdt)
-        self.lvdt_connect_button.pack(side='left', padx=2)
-
-        self.lvdt_stop_button = tk.Button(
-            top_frame, text="STOP", bg='darkred', fg='white',
-            width=8, font=(ui.FONT_FAMILY, 9, 'bold'), state='disabled',
-            command=self.disconnect_lvdt)
-        self.lvdt_stop_button.pack(side='left', padx=2)
-
-        tk.Label(frame, text="COM Port", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.lvdt_com_combo = ttk.Combobox(frame, width=25, state="readonly")
-        self.lvdt_com_combo['values'] = [p.device for p in serial.tools.list_ports.comports()]
-        self.lvdt_com_combo.set("")
-        self.lvdt_com_combo.pack(anchor='w', padx=5)
-
-        tk.Label(frame, text="BAUD Rate", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.lvdt_baud_combo = ttk.Combobox(frame, width=25, state="readonly")
-        self.lvdt_baud_combo['values'] = self.BAUD_RATES
-        self.lvdt_baud_combo.set("")
-        self.lvdt_baud_combo.pack(anchor='w', padx=5)
-
-        self.all_comboboxes.extend([self.lvdt_com_combo, self.lvdt_baud_combo])
-
-        # The four readings the device streams.
-        values_frame = tk.Frame(frame, bg=frame['bg'])
-        values_frame.pack(fill='x', padx=5, pady=(10, 5))
-
-        self.lvdt_value_entries = {}
-        for index, name in enumerate(('P01', 'P02', 'P03', 'P04')):
-            row = tk.Frame(values_frame, bg=frame['bg'])
-            row.grid(row=index // 2, column=index % 2, padx=4, pady=3, sticky='w')
-
-            tk.Label(row, text=f"{name}:", bg=frame['bg'], fg='black',
-                     font=(ui.FONT_FAMILY, 10, 'bold')).pack(side='left')
-
-            entry = tk.Entry(row, width=10, justify='center', state='readonly')
-            entry.pack(side='left', padx=(4, 0))
-            self.lvdt_value_entries[name] = entry
-
-        self.lvdt_status_label = tk.Label(frame, text="Not connected", bg=frame['bg'],
-                                          fg='#666666', font=(ui.FONT_FAMILY, 9))
-        self.lvdt_status_label.pack(anchor='w', padx=5, pady=(5, 0))
 
     def parse_lvdt_data(self, line):
         """Pull the readings out of one streamed line.
@@ -802,7 +722,7 @@ class ComPortSettings:
 
             self.lvdt_port = serial.Serial(port=port, baudrate=int(baud), timeout=1)
             self.lvdt_running = True
-            self.lvdt_status_label.config(text=f"Connected on {port}", fg='#198754')
+            self.lvdt_status_label.config(text=f"Connected on {port}", fg=ui.SUCCESS)
             self.lvdt_connect_button.config(state='disabled')
             self.lvdt_stop_button.config(state='normal')
 
@@ -811,7 +731,7 @@ class ComPortSettings:
 
         except Exception as e:
             messagebox.showerror("LVDT", f"Could not open the LVDT port: {e}")
-            self.lvdt_status_label.config(text="Not connected", fg='#666666')
+            self.lvdt_status_label.config(text="Not connected", fg=ui.TEXT_MUTED)
 
     def read_lvdt_stream(self):
         """Read lines off the LVDT port until asked to stop."""
@@ -827,7 +747,7 @@ class ComPortSettings:
                     self.root.after(0, self.show_lvdt_data, readings)
                 else:
                     self.root.after(0, self.lvdt_status_label.config,
-                                    {'text': 'Improper received string...', 'fg': '#dc3545'})
+                                    {'text': 'Improper received string...', 'fg': ui.DANGER})
             except Exception as e:
                 print(f"LVDT read error: {e}")
                 break
@@ -843,72 +763,11 @@ class ComPortSettings:
 
         self.lvdt_port = None
         try:
-            self.lvdt_status_label.config(text="Not connected", fg='#666666')
+            self.lvdt_status_label.config(text="Not connected", fg=ui.TEXT_MUTED)
             self.lvdt_connect_button.config(state='normal')
             self.lvdt_stop_button.config(state='disabled')
         except Exception:
             pass
-
-    def add_camera_content(self, frame, camera_num):
-        """Build a camera panel: just the port and baud rate it is wired on."""
-        label_style = {'bg': frame['bg'], 'fg': 'black', 'font': (ui.FONT_FAMILY, 10)}
-        frame.camera_num = camera_num
-
-        tk.Label(frame, text="COM Port", **label_style).pack(anchor='w', padx=5, pady=(10, 2))
-        com_combo = ttk.Combobox(frame, width=25, state="readonly")
-        com_combo['values'] = [p.device for p in serial.tools.list_ports.comports()]
-        com_combo.set("")
-        com_combo.pack(anchor='w', padx=5)
-
-        tk.Label(frame, text="BAUD Rate", **label_style).pack(anchor='w', padx=5, pady=2)
-        baud_combo = ttk.Combobox(frame, width=25, state="readonly")
-        baud_combo['values'] = self.BAUD_RATES
-        baud_combo.set("")
-        baud_combo.pack(anchor='w', padx=5)
-
-        self.all_comboboxes.extend([com_combo, baud_combo])
-        self.camera_combos[camera_num] = (com_combo, baud_combo)
-
-    def add_modbus_tcp_content(self, frame):
-        # Test button and IP Address
-        top_frame = tk.Frame(frame, bg=frame['bg'])
-        top_frame.pack(fill='x', padx=5, pady=5)
-        
-        # Test Button
-        self.test_tcp_button = tk.Button(top_frame, text="TEST", bg=ui.ACCENT_FILL, fg='white', 
-                              width=8, font=(ui.FONT_FAMILY, 9, 'bold'),
-                                    command=self.read_modbus_tcp_data)
-        self.test_tcp_button.pack(side='left', padx=5)
-        
-        # IP Address
-        ip_frame = tk.Frame(top_frame, bg=frame['bg'])
-        ip_frame.pack(side='left', padx=5)
-        self.ip_entry = tk.Entry(ip_frame, width=15)
-        self.ip_entry.pack(side='left', padx=2)
-        tk.Label(ip_frame, text="IP Address", bg=frame['bg']).pack(side='left')
-        
-        # Port
-        port_frame = tk.Frame(top_frame, bg=frame['bg'])
-        port_frame.pack(side='left', padx=5)
-        self.port_entry = tk.Entry(port_frame, width=5)
-        self.port_entry.pack(side='left', padx=2)
-        tk.Label(port_frame, text="Port", bg=frame['bg']).pack(side='left')
-        
-        # Style the labels and comboboxes
-        label_style = {'bg': frame['bg'], 'fg': 'black', 'font': (ui.FONT_FAMILY, 10)}
-        
-        # Connect Button
-        self.connect_tcp_button = tk.Button(frame, text="Connect", bg='green', fg='white',
-                                      font=(ui.FONT_FAMILY, 9, 'bold'), command=self.connect_to_modbus_tcp)
-        self.connect_tcp_button.pack(anchor='w', padx=5, pady=5)
-        
-        # Rx String
-        tk.Label(frame, text="Rx String", **label_style).pack(anchor='w', padx=5, pady=2)
-        self.rx_tcp_text = tk.Text(frame, height=10, width=30, font=('Consolas', 10))
-        self.rx_tcp_text.pack(padx=5, pady=5)
-        
-        # Initially disable test button
-        self.test_tcp_button.config(state="disabled")
 
     def connect_to_modbus_tcp(self):
         """Connect to PLC using Modbus TCP"""
@@ -929,6 +788,7 @@ class ComPortSettings:
             if self.modbus_tcp_client.connect():
                 messagebox.showinfo("Connection Status", "Connected to PLC via Modbus TCP!")
                 self.test_tcp_button.config(state="normal")
+                self.tcp_status.config(text=f"Connected to {ip_address}:{port}", fg=ui.SUCCESS)
             else:
                 self.modbus_tcp_client.close()
                 messagebox.showerror("Connection Status", "Failed to connect to PLC via Modbus TCP.")
@@ -967,142 +827,104 @@ class ComPortSettings:
                 messagebox.showerror("Validation Error", "Please fill in all required fields!")
                 return
 
-
             # Save PLC settings
             config.set('PLC_COM_PORT', self.plc_com_combo.get())
             config.set('PLC_BAUD_RATE', self.plc_baud_combo.get())
             config.set('PLC_STATION_ID', self.station_id_entry.get())
-            
+
             # Save Register Address and Points settings
             config.set('PLC_REG_ADDRESS', self.reg_address_entry.get())
             config.set('PLC_POINTS_TO_READ', self.points_entry.get())
-            
+
             # Save Loadcell settings
-            for frame in self.root.winfo_children():
-                if isinstance(frame, tk.Frame):
-                    for child in frame.winfo_children():
-                        if isinstance(child, tk.Frame):
-                            title_label = child.winfo_children()[0]
-                            if isinstance(title_label, tk.Label) and "LOADCELL" in title_label.cget("text"):
-                                loadcell_num = title_label.cget("text").split('-')[1].strip()[:2]
-                                com_combo = child.winfo_children()[2]  # COM port combo
-                                baud_combo = child.winfo_children()[4]  # BAUD rate combo
-                                
-                                config.set(f'LOADCELL_{loadcell_num}_COM_PORT', com_combo.get())
-                                config.set(f'LOADCELL_{loadcell_num}_BAUD_RATE', baud_combo.get())
-            
+            for row in self.loadcell_rows:
+                config.set(f'LOADCELL_{row.loadcell_num}_COM_PORT', row.com_combo.get())
+                config.set(f'LOADCELL_{row.loadcell_num}_BAUD_RATE', row.baud_combo.get())
+
             # Save LVDT settings
             config.set('LVDT_COM_PORT', self.lvdt_com_combo.get())
             config.set('LVDT_BAUD_RATE', self.lvdt_baud_combo.get())
-            
+
             # Save Camera settings
             for camera_num, (com_combo, baud_combo) in self.camera_combos.items():
                 config.set(f'CAMERA_{camera_num:02d}_COM_PORT', com_combo.get())
                 config.set(f'CAMERA_{camera_num:02d}_BAUD_RATE', baud_combo.get())
-            
+
             # Save Modbus TCP settings
             config.set('MODBUS_TCP_IP', self.ip_entry.get())
             config.set('MODBUS_TCP_PORT', self.port_entry.get())
-            
+
             # Disable all inputs
             self._freeze_all_inputs()
-            
+
             # Update button states
             self.control_buttons["SAVE"].config(state="disabled")
             self.control_buttons["EDIT"].config(state="normal")
-            
+
             messagebox.showinfo("Success", "Settings saved successfully!")
-            
+
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save settings!\nError: {str(e)}")
 
     def _validate_settings(self):
-        """Validate that at least one frame has all fields filled"""
-        # Check if PLC frame is complete
+        """Validate that at least one device has all fields filled"""
+        # Check if PLC row is complete
         if all([self.plc_com_combo.get(), self.plc_baud_combo.get(), self.station_id_entry.get()]):
             return True
-            
-        # Check if any Loadcell frame is complete
-        for frame in self.root.winfo_children():
-            if isinstance(frame, tk.Frame):
-                for child in frame.winfo_children():
-                    if isinstance(child, tk.Frame):
-                        title_label = child.winfo_children()[0]
-                        if isinstance(title_label, tk.Label) and "LOADCELL" in title_label.cget("text"):
-                            com_combo = child.winfo_children()[2]  # COM port combo
-                            baud_combo = child.winfo_children()[4]  # BAUD rate combo
-                            if all([com_combo.get(), baud_combo.get()]):
-                                return True
-        
-        # Check if Modbus TCP frame is complete
+
+        # Check if any Loadcell row is complete
+        for row in self.loadcell_rows:
+            if all([row.com_combo.get(), row.baud_combo.get()]):
+                return True
+
+        # Check if Modbus TCP is complete
         if all([self.ip_entry.get(), self.port_entry.get()]):
             return True
-            
+
         return False
 
     def _freeze_all_inputs(self):
         """Helper method to disable all input fields"""
-        # Disable PLC inputs
-        self.plc_com_combo.config(state="disabled")
-        self.plc_baud_combo.config(state="disabled")
-        self.station_id_entry.config(state="disabled")
-        self.reg_address_entry.config(state="disabled") 
-        self.points_entry.config(state="disabled")
-        
-        # Disable all comboboxes
         for combo in self.all_comboboxes:
             combo.config(state="disabled")
-        
-        # Disable Modbus TCP inputs
-        self.ip_entry.config(state="disabled")
-        self.port_entry.config(state="disabled")
+        for entry in self.all_entries:
+            entry.config(state="disabled")
 
     def enable_editing(self):
         """Enable editing of all input fields"""
-        # Enable PLC inputs
-        self.plc_com_combo.config(state="readonly")
-        self.plc_baud_combo.config(state="readonly")
-        self.station_id_entry.config(state="normal")
-        self.reg_address_entry.config(state="normal")
-        self.points_entry.config(state="normal")
-        
-        # Enable all comboboxes
         for combo in self.all_comboboxes:
             combo.config(state="readonly")
-        
-        # Enable Modbus TCP inputs
-        self.ip_entry.config(state="normal")
-        self.port_entry.config(state="normal")
-        
+        for entry in self.all_entries:
+            entry.config(state="normal")
+
         # Update button states
         self.control_buttons["SAVE"].config(state="normal")
         self.control_buttons["EDIT"].config(state="disabled")
-        
+
         messagebox.showinfo("Edit Mode", "Settings are now editable")
 
     def reset_settings(self):
         """Reset all settings and clear environment variables"""
         try:
             # Ask for confirmation
-            if not messagebox.askyesno("Confirm Reset", 
+            if not messagebox.askyesno("Confirm Reset",
                                      "Are you sure you want to reset all settings?"):
                 return
-            
-            # Get the .env file path
+
             # Settings to clear
             env_vars = [
                 'PLC_COM_PORT', 'PLC_BAUD_RATE', 'PLC_STATION_ID',
                 'MODBUS_TCP_IP', 'MODBUS_TCP_PORT',
                 'LVDT_COM_PORT', 'LVDT_BAUD_RATE'
             ]
-            
+
             # Add camera settings
             for i in range(1, self.CAMERA_COUNT + 1):
                 env_vars.extend([
                     f'CAMERA_{i:02d}_COM_PORT',
                     f'CAMERA_{i:02d}_BAUD_RATE'
                 ])
-            
+
             # Add loadcell environment variables
             for i in range(1, self.LOADCELL_COUNT + 1):
                 loadcell_num = f"{i:02d}"
@@ -1110,22 +932,22 @@ class ComPortSettings:
                     f'LOADCELL_{loadcell_num}_COM_PORT',
                     f'LOADCELL_{loadcell_num}_BAUD_RATE'
                 ])
-            
+
             # Clear each setting
             for var in env_vars:
                 config.set(var, '')
-            
+
             # Reset all inputs to default values
             self._reset_to_defaults()
-            
+
             # Enable editing
             self.enable_editing()
-            
+
             # Close any existing connections
             self.cleanup()
-            
+
             messagebox.showinfo("Reset Complete", "All settings have been reset to default values")
-            
+
         except Exception as e:
             messagebox.showerror("Reset Error", f"Error during reset: {str(e)}")
 
@@ -1139,37 +961,21 @@ class ComPortSettings:
             config.set('PLC_REG_ADDRESS', '')
             config.set('PLC_POINTS_TO_READ', '1')
 
-            # Get available COM ports
-            available_ports = [port.device for port in serial.tools.list_ports.comports()]
-            
-            # Reset PLC settings
-            self.plc_com_combo.set("")
-            self.plc_baud_combo.set("")
-            self.station_id_entry.delete(0, tk.END)
-            self.reg_address_entry.delete(0, tk.END)
-            self.points_entry.delete(0, tk.END)
+            # Pick up ports plugged in since the page opened
+            self.available_ports = [port.device for port in serial.tools.list_ports.comports()]
+
+            # Empty every port and baud rate box, and every typed setting
+            for combo in self.all_comboboxes:
+                combo.config(state="readonly")
+                combo.set("")
+            for entry in self.all_entries:
+                entry.config(state="normal")
+                entry.delete(0, tk.END)
+            for row in self.loadcell_rows:
+                row.com_combo['values'] = self.available_ports or [""]
             self.points_entry.insert(0, "1")  # Reset to default of 1
-            self.rx_text.delete("1.0", tk.END)
-            
-            # Reset all COM port combos and Rx strings for Loadcells
-            for frame in self.root.winfo_children():
-                if isinstance(frame, tk.Frame):
-                    for child in frame.winfo_children():
-                        if isinstance(child, tk.Frame):
-                            if "LOADCELL" in child.winfo_children()[0].cget("text"):
-                                com_combo = child.winfo_children()[2]
-                                baud_combo = child.winfo_children()[4]
-                                rx_text = child.rx_text
-                                
-                                com_combo['values'] = available_ports if available_ports else [""]
-                                com_combo.set("")
-                                baud_combo.set("")
-                                rx_text.delete("1.0", tk.END)
-            
-            # Reset Modbus TCP settings
-            self.ip_entry.delete(0, tk.END)
-            self.port_entry.delete(0, tk.END)
-            self.rx_tcp_text.delete("1.0", tk.END)
+
+            self.log_text.delete("1.0", tk.END)
 
         except Exception as e:
             print(f"Error resetting to defaults: {str(e)}")
@@ -1181,40 +987,27 @@ class ComPortSettings:
             plc_port = config.get('PLC_COM_PORT', '')
             plc_baud = config.get('PLC_BAUD_RATE', '')
             plc_station_id = config.get('PLC_STATION_ID', '')
-            
+
             self.plc_com_combo.set(plc_port)
             self.plc_baud_combo.set(plc_baud)
             self.station_id_entry.delete(0, tk.END)
             self.station_id_entry.insert(0, plc_station_id)
-            
+
             # Load Register Address and Points settings if they exist
             reg_address = config.get('PLC_REG_ADDRESS', '')
             points_to_read = config.get('PLC_POINTS_TO_READ', '1')
-            
+
             self.reg_address_entry.delete(0, tk.END)
             self.reg_address_entry.insert(0, reg_address)
-            
+
             self.points_entry.delete(0, tk.END)
             self.points_entry.insert(0, points_to_read)
-            
+
             # Load Loadcell settings
-            for frame in self.root.winfo_children():
-                if isinstance(frame, tk.Frame):
-                    for child in frame.winfo_children():
-                        if isinstance(child, tk.Frame):
-                            title_label = child.winfo_children()[0]
-                            if isinstance(title_label, tk.Label) and "LOADCELL" in title_label.cget("text"):
-                                loadcell_num = title_label.cget("text").split('-')[1].strip()[:2]
-                                com_combo = child.winfo_children()[2]
-                                baud_combo = child.winfo_children()[4]
-                                
-                                com_port = config.get(f'LOADCELL_{loadcell_num}_COM_PORT', '')
-                                baud_rate = config.get(f'LOADCELL_{loadcell_num}_BAUD_RATE', '')
-                                
-                                com_combo.set(com_port)
-                                baud_combo.set(baud_rate)
-            
-            # Load Modbus TCP settings
+            for row in self.loadcell_rows:
+                row.com_combo.set(config.get(f'LOADCELL_{row.loadcell_num}_COM_PORT', ''))
+                row.baud_combo.set(config.get(f'LOADCELL_{row.loadcell_num}_BAUD_RATE', ''))
+
             # Restore LVDT settings
             lvdt_port = config.get('LVDT_COM_PORT', '')
             lvdt_baud = config.get('LVDT_BAUD_RATE', '')
@@ -1222,7 +1015,7 @@ class ComPortSettings:
                 self.lvdt_com_combo.set(lvdt_port)
             if lvdt_baud:
                 self.lvdt_baud_combo.set(lvdt_baud)
-            
+
             # Restore Camera settings
             for camera_num, (com_combo, baud_combo) in self.camera_combos.items():
                 saved_port = config.get(f'CAMERA_{camera_num:02d}_COM_PORT', '')
@@ -1231,21 +1024,22 @@ class ComPortSettings:
                     com_combo.set(saved_port)
                 if saved_baud:
                     baud_combo.set(saved_baud)
-            
+
+            # Load Modbus TCP settings
             modbus_ip = config.get('MODBUS_TCP_IP', '')
             modbus_port = config.get('MODBUS_TCP_PORT', '')
-            
+
             self.ip_entry.delete(0, tk.END)
             self.ip_entry.insert(0, modbus_ip)
             self.port_entry.delete(0, tk.END)
             self.port_entry.insert(0, modbus_port)
-            
+
             # If we have saved settings, freeze the inputs
             if any([plc_port, plc_baud, plc_station_id, modbus_ip, modbus_port]):
                 self._freeze_all_inputs()
                 self.control_buttons["SAVE"].config(state="disabled")
                 self.control_buttons["EDIT"].config(state="normal")
-                
+
         except Exception as e:
             messagebox.showerror("Load Error", f"Failed to load settings!\nError: {str(e)}")
 
@@ -1289,66 +1083,34 @@ class ComPortSettings:
             data = self.loadcell_data.get(loadcell_num, [])
             
             # Clear current display
-            frame.rx_text.delete("1.0", tk.END)
+            self.log_text.delete("1.0", tk.END)
             
             if data:
                 # Display last 5 entries
-                frame.rx_text.insert(tk.END, "Previous readings:\n")
+                self.log_text.insert(tk.END, "Previous readings:\n")
                 for entry in data[-5:]:
-                    frame.rx_text.insert(tk.END, 
+                    self.log_text.insert(tk.END, 
                                        f"{entry['timestamp']}: {entry['value']}\n")
             else:
-                frame.rx_text.insert(tk.END, "No previous readings available\n")
+                self.log_text.insert(tk.END, "No previous readings available\n")
             
         except Exception as e:
-            frame.rx_text.insert(tk.END, f"Error loading previous data: {str(e)}\n")
+            self.log_text.insert(tk.END, f"Error loading previous data: {str(e)}\n")
 
     def save_device_values(self):
-        """Save PLC and loadcell values to environment variables"""
+        """Keep what the devices sent back, for the next time the page opens"""
         try:
-
-            # Save PLC Rx string
-            plc_rx = self.rx_text.get("1.0", tk.END).strip()
-            config.set('PLC_RX_DATA', plc_rx)
-
-            # Save Loadcell Rx strings
-            for frame in self.root.winfo_children():
-                if isinstance(frame, tk.Frame):
-                    for child in frame.winfo_children():
-                        if isinstance(child, tk.Frame):
-                            title_label = child.winfo_children()[0]
-                            if isinstance(title_label, tk.Label) and "LOADCELL" in title_label.cget("text"):
-                                loadcell_num = title_label.cget("text").split('-')[1].strip()[:2]
-                                rx_text = child.rx_text  # Get the Text widget reference
-                                rx_data = rx_text.get("1.0", tk.END).strip()
-                                config.set(f'LOADCELL_{loadcell_num}_RX_DATA', rx_data)
-
+            config.set('PLC_RX_DATA', self.log_text.get("1.0", tk.END).strip())
         except Exception as e:
             print(f"Error saving device values: {str(e)}")
 
     def load_device_values(self):
-        """Load PLC and loadcell values from environment variables"""
+        """Show what the devices sent back last time"""
         try:
-            # Load PLC Rx string
-            plc_rx = config.get('PLC_RX_DATA', '')
-            if plc_rx:
-                self.rx_text.delete("1.0", tk.END)
-                self.rx_text.insert(tk.END, plc_rx)
-
-            # Load Loadcell Rx strings
-            for frame in self.root.winfo_children():
-                if isinstance(frame, tk.Frame):
-                    for child in frame.winfo_children():
-                        if isinstance(child, tk.Frame):
-                            title_label = child.winfo_children()[0]
-                            if isinstance(title_label, tk.Label) and "LOADCELL" in title_label.cget("text"):
-                                loadcell_num = title_label.cget("text").split('-')[1].strip()[:2]
-                                rx_text = child.rx_text  # Get the Text widget reference
-                                rx_data = config.get(f'LOADCELL_{loadcell_num}_RX_DATA', '')
-                                if rx_data:
-                                    rx_text.delete("1.0", tk.END)
-                                    rx_text.insert(tk.END, rx_data)
-
+            rx_data = config.get('PLC_RX_DATA', '')
+            if rx_data:
+                self.log_text.delete("1.0", tk.END)
+                self.log_text.insert(tk.END, rx_data)
         except Exception as e:
             print(f"Error loading device values: {str(e)}")
 
