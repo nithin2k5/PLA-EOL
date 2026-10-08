@@ -662,54 +662,74 @@ class EOLTesterGUI:
                                       padx=18, cursor='hand2', command=self.start_test_click)
         self.start_button.pack(side='right', padx=(0, 4), pady=8)
 
-        # Whether the cameras check each part. It is Vision Settings' "Vision
-        # enabled" too, so the two agree and the choice holds on reopening.
-        # A large box, as Tk's own is too small to see at a glance on the line
-        self.vision_check_var = tk.BooleanVar(value=self.vision_check_saved())
-        self.vision_check_box = ctk.CTkCheckBox(
-            bar, text="VISION CHECK", variable=self.vision_check_var,
-            command=self.toggle_vision_check, bg_color=bar.cget('bg'),
-            fg_color=ui.SUCCESS, hover_color=ui.SUCCESS_HOVER, border_color='black',
-            text_color='black', checkbox_width=26, checkbox_height=26,
-            font=(self.FONT, 14, 'bold'))
-        self.vision_check_box.pack(side='right', padx=(0, 16), pady=8)
-        if stripe_check is None:
-            self.vision_check_var.set(False)
-            self.vision_check_box.configure(state='disabled')
+        # Whether each camera checks the part. CAM1 is Vision Settings'
+        # "Camera 1 check enabled" too, so the two agree; both choices hold on
+        # reopening. Large boxes, as Tk's own are too small to see at a glance
+        # on the line. Packed from the right, so they read CAM1, CAM2.
+        self.camera_check_vars = {}
+        self.camera_check_boxes = {}
+        for number in (2, 1):
+            var = tk.BooleanVar(value=self.camera_check_saved(number))
+            box = ctk.CTkCheckBox(
+                bar, text=f"CAM{number}", variable=var,
+                command=lambda n=number: self.toggle_camera_check(n),
+                bg_color=bar.cget('bg'),
+                fg_color=ui.SUCCESS, hover_color=ui.SUCCESS_HOVER, border_color='black',
+                text_color='black', checkbox_width=26, checkbox_height=26,
+                font=(self.FONT, 14, 'bold'))
+            box.pack(side='right', padx=(0, 16), pady=8)
+            if stripe_check is None:
+                var.set(False)
+                box.configure(state='disabled')
+            self.camera_check_vars[number] = var
+            self.camera_check_boxes[number] = box
 
-    @staticmethod
-    def vision_check_saved():
+    # Where each camera's on/off choice is kept in the vision settings
+    CAMERA_CHECK_KEYS = {1: "vision_enabled", 2: "cam2_enabled"}
+
+    @classmethod
+    def camera_check_saved(cls, number):
         if stripe_check is None:
             return False
-        return bool(load_vision_config().get("vision_enabled", True))
+        cfg = load_vision_config()
+        # Before the cameras had a box each, one setting turned both on or
+        # off; camera 2 follows it until it has a choice of its own
+        default = cfg.get("vision_enabled", True)
+        return bool(cfg.get(cls.CAMERA_CHECK_KEYS[number], default))
 
-    def toggle_vision_check(self):
-        """Change VISION CHECK after a login; it applies from the next test started.
+    def camera_check_on(self, number):
+        """Whether camera `number` checks the part in the next test started."""
+        return stripe_check is not None and self.camera_check_vars[number].get()
 
-        Turning the cameras off lets parts pass without them, so the change
-        needs the same login as Settings and Vision Settings.
+    def toggle_camera_check(self, number):
+        """Change a camera's box after a login; it applies from the next test started.
+
+        Turning a camera off lets parts pass without it, so the change needs
+        the same login as Settings and Vision Settings.
         """
         from login_form import prompt_login
 
-        on = self.vision_check_var.get()
+        var = self.camera_check_vars[number]
+        on = var.get()
         # The box has already changed on the click; put it back until
         # someone has logged in
-        self.vision_check_var.set(not on)
+        var.set(not on)
         user = prompt_login(self.root)
         if user is None:
-            self.safe_update_message("Vision check not changed - a login is needed.", "red")
+            self.safe_update_message(f"Camera {number} check not changed - a login is needed.",
+                                     "red")
             return
-        self.vision_check_var.set(on)
+        var.set(on)
         try:
             cfg = load_vision_config()
-            cfg["vision_enabled"] = on
+            cfg[self.CAMERA_CHECK_KEYS[number]] = on
             save_vision_config(cfg)
         except OSError as e:
-            messagebox.showerror("Vision Check", f"Could not save the setting: {e}")
-        self.log_operator_action("VISION_CHECK", f"{'On' if on else 'Off'} by {user}")
+            messagebox.showerror("Camera Check", f"Could not save the setting: {e}")
+        self.log_operator_action(f"CAM{number}_CHECK", f"{'On' if on else 'Off'} by {user}")
         self.safe_update_message(
-            "Vision check on - the cameras check each part." if on else
-            "Vision check off - the cameras will not check the parts.",
+            f"Camera {number} check on - it checks each part." if on else
+            f"Camera {number} check off - it will not check the parts.",
             "green" if on else "red")
 
     def start_test_click(self):
@@ -1362,19 +1382,20 @@ class EOLTesterGUI:
         threading.Thread(target=captures.remove_old, daemon=True).start()
 
     def unconfigured_cameras(self):
-        """Names of the cameras with no device chosen, e.g. ["Camera 2"]."""
-        sources = (("Camera 1", self.camera1_source()), ("Camera 2", stripe_check.CAMERA_SOURCE))
-        return [name for name, source in sources if load_camera_config(source)[0] < 0]
+        """Names of the ticked cameras with no device chosen, e.g. ["Camera 2"]."""
+        sources = ((1, self.camera1_source()), (2, stripe_check.CAMERA_SOURCE))
+        return [f"Camera {number}" for number, source in sources
+                if self.camera_check_on(number) and load_camera_config(source)[0] < 0]
 
     def cameras_ready_for_test(self):
         """True if a test may start; otherwise abort it and say which camera is missing.
 
-        With VISION CHECK ticked, both cameras must be set up, so a part is
-        never tested on the assumption that the cameras checked it. With it
-        unticked the cameras aren't used, and a test may start without them.
-        Call this before the PLC is told to start.
+        Each camera ticked must be set up, so a part is never tested on the
+        assumption that a camera checked it. A camera unticked isn't used,
+        and a test may start without it. Call this before the PLC is told to
+        start.
         """
-        if stripe_check is None or not self.vision_check_var.get():
+        if stripe_check is None:
             return True
         missing = self.unconfigured_cameras()
         if not missing:
@@ -1387,7 +1408,7 @@ class EOLTesterGUI:
             "Test Aborted",
             f"The test was not started: {names} {verb} not configured.\n\n"
             "Click the camera's picture on this screen to choose its device, then "
-            "start the test again. To test without the cameras, untick VISION CHECK.",
+            "start the test again. To test without a camera, untick its CAM box.",
             parent=self.root)
         return False
 
@@ -1466,18 +1487,21 @@ class EOLTesterGUI:
         if getattr(self, 'startingNGCableValidation', False) or \
                 getattr(self, 'endingNGCableValidation', False):
             return      # a known-bad cable is checked by the PLC alone, and not saved
-        if stripe_check is None or not self.vision_check_var.get():
-            # VISION CHECK is off: neither camera judges the part, and
-            # camera 1 keeps the PLC's verdict
+        cam1_on, cam2_on = self.camera_check_on(1), self.camera_check_on(2)
+        if not (cam1_on or cam2_on):
+            # Both cameras are off: neither judges the part, and camera 1
+            # keeps the PLC's verdict
             self.cam2Result = "OFF"
             self.update_cam2_status("OFF")
             self.camera_checks_done = True
             return
 
+        # A camera ticked off takes no picture and judges nothing: camera 1
+        # then keeps the PLC's verdict, and camera 2 shows OFF
         part_number = self.partNumber
         vision = VisionController()
-        check_cam1 = bool(part_number) and vision.has_model(part_number)
-        check_cam2 = bool(part_number) and stripe_check.has_model(part_number)
+        check_cam1 = cam1_on and bool(part_number) and vision.has_model(part_number)
+        check_cam2 = cam2_on and bool(part_number) and stripe_check.has_model(part_number)
         self.cam1Image = self.cam2Image = None
         self.camera_check_running = True
         self.cam1_by_app = check_cam1
@@ -1502,7 +1526,7 @@ class EOLTesterGUI:
                         out["cam1_frame"] = captures.outlined(result.frame, outline, verdict)
                         out["cam1_image"] = captures.save(result.frame, "CAM1", part_number,
                                                           verdict, "", outline)
-                else:
+                elif cam1_on:
                     frame = self.grab_camera1()
                     if frame is not None:
                         out["cam1_frame"] = frame
@@ -1520,7 +1544,7 @@ class EOLTesterGUI:
                         out["cam2_image"] = captures.save(
                             result.frame, "CAM2", part_number, verdict,
                             result.seen, result.stripe_boxes)
-                else:
+                elif cam2_on:
                     frame = stripe_check.capture_frame()
                     if frame is not None:
                         out["cam2_frame"] = frame
@@ -2962,8 +2986,8 @@ class EOLTesterGUI:
                             self.prnFileContent = f.read()
                 
                 # The writes below start the test, so the cameras are checked
-                # first: with VISION CHECK on and a camera not set up, the
-                # part stays on show but the test is aborted
+                # first: with a camera's box ticked and that camera not set
+                # up, the part stays on show but the test is aborted
                 if not self.cameras_ready_for_test():
                     # Not loaded for testing: START asks for the ALC code
                     # again rather than run the previous part's program

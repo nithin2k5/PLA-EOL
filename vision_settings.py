@@ -1154,8 +1154,9 @@ def render(parent):
         value=float(v_cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)))
     initial = (enabled_var.get(), round(thresh_var.get(), 2))
 
-    ttk.Checkbutton(ib, text="Vision enabled", variable=enabled_var).pack(fill="x")
-    tk.Label(ib, text="When off, the test cycle skips vision entirely.",
+    ttk.Checkbutton(ib, text="Camera 1 check enabled", variable=enabled_var).pack(fill="x")
+    tk.Label(ib, text="The Test console's CAM1 box. When off, camera 1 doesn't check "
+                      "the parts; camera 2 has its own CAM2 box there.",
              bg=PANEL, fg=TXT_FAINT, font=(FONT, 10), anchor="w",
              wraplength=265, justify="left").pack(fill="x", padx=(22, 0), pady=(0, 12))
 
