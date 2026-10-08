@@ -717,6 +717,9 @@ class EOLTesterGUI:
         if not connected:
             messagebox.showerror("Start Test", "The PLC is not connected.")
             return
+        # Before the PLC is told anything, so an aborted test never starts
+        if not self.cameras_ready_for_test():
+            return
 
         # Each failed write says which coil it tried and what the PLC answered
         not_m_coil = "address missing or not an M coil (e.g. M1000)"
@@ -1343,27 +1346,36 @@ class EOLTesterGUI:
             return
         self.start_camera_streams()
         threading.Thread(target=captures.remove_old, daemon=True).start()
-        # Once the window is up, so the warning isn't hidden behind it
-        self.root.after(1500, self.warn_cameras_not_configured)
 
     def unconfigured_cameras(self):
         """Names of the cameras with no device chosen, e.g. ["Camera 2"]."""
         sources = (("Camera 1", self.camera1_source()), ("Camera 2", stripe_check.CAMERA_SOURCE))
         return [name for name, source in sources if load_camera_config(source)[0] < 0]
 
-    def warn_cameras_not_configured(self):
-        """Tell the operator which cameras have no device chosen."""
+    def cameras_ready_for_test(self):
+        """True if a test may start; otherwise abort it and say which camera is missing.
+
+        With VISION CHECK ticked, both cameras must be set up, so a part is
+        never tested on the assumption that the cameras checked it. With it
+        unticked the cameras aren't used, and a test may start without them.
+        Call this before the PLC is told to start.
+        """
+        if stripe_check is None or not self.vision_check_var.get():
+            return True
         missing = self.unconfigured_cameras()
         if not missing:
-            return
+            return True
         names = " and ".join(missing)
         verb = "are" if len(missing) > 1 else "is"
-        messagebox.showwarning(
-            "Camera Not Configured",
-            f"{names} {verb} not configured.\n\n"
-            "Click the camera's picture on this screen, or open Vision Settings, "
-            "to choose its device.",
+        self.log_operator_action("TEST_ABORTED", f"{names} not configured")
+        self.safe_update_message(f"Test aborted - {names} {verb} not configured.", "red")
+        messagebox.showerror(
+            "Test Aborted",
+            f"The test was not started: {names} {verb} not configured.\n\n"
+            "Click the camera's picture on this screen to choose its device, then "
+            "start the test again. To test without the cameras, untick VISION CHECK.",
             parent=self.root)
+        return False
 
     def start_camera_streams(self):
         """Open each camera that is set up and show it on its live view."""
@@ -2935,6 +2947,20 @@ class EOLTesterGUI:
                         with open(self.barcodePrintFileNamePath, 'r') as f:
                             self.prnFileContent = f.read()
                 
+                # The writes below start the test, so the cameras are checked
+                # first: with VISION CHECK on and a camera not set up, the
+                # part stays on show but the test is aborted
+                if not self.cameras_ready_for_test():
+                    # Not loaded for testing: START asks for the ALC code
+                    # again rather than run the previous part's program
+                    self.current_part_number = None
+                    cursor.close()
+                    connection.close()
+                    self.alc_entry.configure(state='normal')
+                    self.alc_entry.delete(0, tk.END)
+                    self.show_placeholder(self.alc_entry, self.ALC_PLACEHOLDER)
+                    return
+
                 # ===================================================================
                 # NOTE: Write to PLC during ALC code processing
                 # These writes TRIGGER the PLC to start the test automatically
