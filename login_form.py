@@ -14,8 +14,12 @@ import ui
 # hash rather than in the EMPLOYEE_INFO table. It is checked before the table
 # is consulted, so it works even when EMPLOYEE_INFO has no row for it - which
 # is the point, since it is what gets you in when the table is the problem.
-SERVICE_ACCOUNT_USER = config.get('SERVICE_ACCOUNT_USER', '')
-SERVICE_ACCOUNT_PASSWORD_HASH = config.get('SERVICE_ACCOUNT_PASSWORD_HASH', '')
+# Left blank in .config, it falls back to the built-in 'nice' account, whose
+# password hash below is for 'nice1234'.
+SERVICE_ACCOUNT_USER = config.get('SERVICE_ACCOUNT_USER', 'nice')
+SERVICE_ACCOUNT_PASSWORD_HASH = config.get(
+    'SERVICE_ACCOUNT_PASSWORD_HASH',
+    '/lIwG9OGL81pjmXwBqokDHbyhYTYgX2HuIlJQ0HQaUjLYg64LgD7xEq+qg7BnVRnoukWtW4xp8ATOMsAgMhc26/Kxmq8x0c=')
 
 
 class LoginForm(tk.Toplevel):
@@ -27,6 +31,9 @@ class LoginForm(tk.Toplevel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Kept hidden until it is centred, so it doesn't flash up in the
+        # corner first
+        self.withdraw()
 
         self.authenticated = False
         self.user_name = None
@@ -49,9 +56,10 @@ class LoginForm(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self.cancel_click)
         self.bind('<Escape>', lambda event: self.cancel_click())
-        self.center_on_parent(parent)
-
         self.transient(parent)
+        self.center_on_parent(parent)
+        self.deiconify()
+        self.lift()
         self.grab_set()
         self.txt_employee.focus_set()
 
@@ -96,17 +104,33 @@ class LoginForm(tk.Toplevel):
     def center_on_parent(self, parent):
         """Place the dialog in the middle of its parent, or of the screen."""
         self.update_idletasks()
-        width = self.winfo_width()
-        height = self.winfo_height()
+        # The requested size, since the actual size is 1x1 until the window
+        # has been shown
+        width = self.winfo_reqwidth()
+        height = self.winfo_reqheight()
+
+        # The geometry set below places the outside of the window frame, so
+        # count the title bar and borders in its size. They match the
+        # parent's, which has already been drawn and can be measured.
+        if parent is not None and parent.winfo_viewable():
+            border = max(parent.winfo_rootx() - parent.winfo_x(), 0)
+            title_bar = max(parent.winfo_rooty() - parent.winfo_y(), 0)
+            width += 2 * border
+            height += title_bar + border
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
 
         if parent is not None and parent.winfo_viewable():
             x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
             y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
         else:
-            x = (self.winfo_screenwidth() - width) // 2
-            y = (self.winfo_screenheight() - height) // 2
+            x = (screen_width - width) // 2
+            y = (screen_height - height) // 2
 
-        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        # Keep it fully on screen even when the parent is partly off it
+        x = min(max(x, 0), max(screen_width - width, 0))
+        y = min(max(y, 0), max(screen_height - height, 0))
+        self.geometry(f"+{x}+{y}")
 
     def load_employees(self):
         """Pre-load active employees into memory. False means database is unreachable."""
@@ -122,6 +146,14 @@ class LoginForm(tk.Toplevel):
             cursor.close()
             conn.close()
         except mysql.connector.Error as err:
+            if SERVICE_ACCOUNT_USER:
+                # The service account doesn't need the table, so still let
+                # it in.
+                messagebox.showwarning("Database Error",
+                                       f"Failed to load employee list: {err}\n\n"
+                                       "Only the service account can log in.",
+                                       parent=self)
+                return True
             messagebox.showerror("Database Error",
                                  f"Failed to load employee list: {err}", parent=self)
             return False
