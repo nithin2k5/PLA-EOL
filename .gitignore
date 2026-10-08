@@ -12,3 +12,7 @@ logs/operator_actions.log
 
 # Camera pictures kept with each test - local to each machine
 vision_captures/
+
+# Camera devices and vision settings - chosen on each machine
+camera_cfg.ini
+vision_config.json
