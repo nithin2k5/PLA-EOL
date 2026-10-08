@@ -24,8 +24,9 @@ from plc_address import bit_address
 # kept with each test. Without OpenCV the console still runs, camera 2 shows
 # OFF and no pictures are kept.
 try:
+    import numpy as np
     from vision_engine import camera, captures, stripe_check
-    from vision_engine import load_camera_config, load_vision_config
+    from vision_engine import VisionController, load_camera_config, load_vision_config
 except ImportError:
     camera = captures = stripe_check = None
 
@@ -508,6 +509,9 @@ class EOLTesterGUI:
         self.cam2Image = None
         self.camera_streams = {}    # by camera source, e.g. "cam2"
         self.camera_check_running = False
+        self.camera_checks_done = False     # this test's checks are in
+        self.after_camera_checks_do = None  # waiting for them, to save the part
+        self.cam1_by_app = False            # camera 1 judged here, not by the PLC
         self.resetPLCOnFormClosing = False
         self.machineOnPLCCoilAddress = ""
         self.alertOnPLCCoilAddress = ""
@@ -1252,6 +1256,9 @@ class EOLTesterGUI:
         """
         if len(self.process_addresses) < 11:
             return
+        # The app checked camera 1 itself for this part; that verdict stands
+        if self.cam1_by_app:
+            return
 
         cam_ok = status_values.get(self.process_addresses[8], False)
         cam_ng = status_values.get(self.process_addresses[9], False)
@@ -1349,41 +1356,77 @@ class EOLTesterGUI:
                  "OFF": self.SILVER, "CHECKING": self.SKY}
         self.cam2_view.set_status(result, fills.get(result, self.SKY))
 
-    def run_camera_checks(self, then):
-        """Check the stripes on camera 2 and keep both cameras' pictures.
+    @staticmethod
+    def verdict_of(result):
+        """PASS, NG or ERROR for a vision or stripe check result."""
+        return "PASS" if result.ok else "NG" if result.judgement == "NG" else "ERROR"
 
-        Runs on a worker thread so the window keeps painting while the
-        cameras are read; `then` runs back on the Tk thread with cam2Result,
-        cam1Image and cam2Image set. Camera 1's verdict comes from the PLC,
-        so only its picture is taken here. A part with no taught stripes is
-        not checked and shows OFF, though its picture is still kept.
+    def start_camera_checks(self):
+        """Check the part on both cameras as its test starts.
+
+        Camera 1 looks for missing parts with the check taught for the part
+        in Vision Settings; camera 2 checks the stripes. Both run on a worker
+        thread so the window keeps painting, and their verdicts show as soon
+        as they are in, while the PLC carries on with the test. A part with
+        nothing taught for a camera isn't checked on it: camera 1 then keeps
+        the PLC's verdict, and camera 2 shows OFF. Each camera's picture is
+        kept either way.
         """
+        if self.camera_check_running:
+            return
+        # Every start is a new test, even after one abandoned before its
+        # result, so nothing from an earlier check carries over
+        self.camera_checks_done = False
+        self.cam1_by_app = False
+        if getattr(self, 'startingNGCableValidation', False) or \
+                getattr(self, 'endingNGCableValidation', False):
+            return      # a known-bad cable is checked by the PLC alone, and not saved
+        if stripe_check is None:
+            self.cam2Result = "OFF"
+            self.camera_checks_done = True
+            return
+
         part_number = self.partNumber
-        cam1_verdict = self.cam1Result
-        checking = (stripe_check is not None and bool(part_number)
-                    and stripe_check.has_model(part_number))
+        vision = VisionController()
+        check_cam1 = (bool(part_number) and vision.config.get("vision_enabled", True)
+                      and vision.has_model(part_number))
+        check_cam2 = bool(part_number) and stripe_check.has_model(part_number)
         self.cam1Image = self.cam2Image = None
         self.camera_check_running = True
-        if checking:
+        self.cam1_by_app = check_cam1
+        if check_cam1:
+            self.cam1_view.set_status("CHECKING", self.SKY)
+        if check_cam2:
             self.update_cam2_status("CHECKING")
         out = {}
 
         def work():
-            if stripe_check is None:
-                return
             try:
-                frame = self.grab_camera1()
-                if frame is not None:
-                    out["cam1_frame"] = frame
-                    out["cam1_image"] = captures.save(frame, "CAM1", part_number, cam1_verdict)
+                if check_cam1:
+                    result = vision.inspect(part_number)
+                    out["cam1"] = result
+                    verdict = self.verdict_of(result)
+                    if result.frame is not None:
+                        outline = []
+                        if result.match_box:
+                            x, y, w, h = result.match_box
+                            outline = [np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+                                                np.float32)]
+                        out["cam1_frame"] = captures.outlined(result.frame, outline, verdict)
+                        out["cam1_image"] = captures.save(result.frame, "CAM1", part_number,
+                                                          verdict, "", outline)
+                else:
+                    frame = self.grab_camera1()
+                    if frame is not None:
+                        out["cam1_frame"] = frame
+                        out["cam1_image"] = captures.save(frame, "CAM1", part_number, "")
             except Exception as e:
-                print(f"[CAM1] no picture: {e}")
+                out["cam1_error"] = str(e)
             try:
-                if checking:
+                if check_cam2:
                     result = stripe_check.inspect(part_number)
-                    out["result"] = result
-                    verdict = ("PASS" if result.ok else
-                               "NG" if result.judgement == "NG" else "ERROR")
+                    out["cam2"] = result
+                    verdict = self.verdict_of(result)
                     if result.frame is not None:
                         out["cam2_frame"] = captures.outlined(
                             result.frame, result.stripe_boxes, verdict)
@@ -1396,7 +1439,7 @@ class EOLTesterGUI:
                         out["cam2_frame"] = frame
                         out["cam2_image"] = captures.save(frame, "CAM2", part_number, "OFF")
             except Exception as e:
-                out["error"] = str(e)
+                out["cam2_error"] = str(e)
 
         worker = threading.Thread(target=work, daemon=True)
         worker.start()
@@ -1411,24 +1454,57 @@ class EOLTesterGUI:
             # Hold what was judged on screen until the next part
             self.cam1_view.hold(out.get("cam1_frame"))
             self.cam2_view.hold(out.get("cam2_frame"))
-            result = out.get("result")
-            if not checking:
+            problems = []
+
+            if check_cam1:
+                result = out.get("cam1")
+                self.cam1Result = self.verdict_of(result) if result else "ERROR"
+                fills = {"PASS": '#00FF00', "NG": '#FF0000', "ERROR": '#FFA500'}
+                self.cam1_view.set_status(self.cam1Result, fills[self.cam1Result])
+                if self.cam1Result != "PASS":
+                    problems.append(f"Camera 1 {self.cam1Result}: "
+                                    f"{result.error if result else out.get('cam1_error')}")
+                print(f"[CAM1] {part_number}: {self.cam1Result} "
+                      f"({result.error or 'part found' if result else out.get('cam1_error')})")
+
+            if not check_cam2:
                 self.cam2Result = "OFF"
-            elif result is None:
-                self.cam2Result = "ERROR"
-                self.safe_update_message(f"Camera 2 check failed: {out.get('error')}", "red")
-            elif result.ok:
-                self.cam2Result = "PASS"
             else:
-                self.cam2Result = "NG" if result.judgement == "NG" else "ERROR"
-                self.safe_update_message(f"Camera 2 {self.cam2Result}: {result.error}", "red")
-            self.update_cam2_status(self.cam2Result)
-            if checking:
+                result = out.get("cam2")
+                self.cam2Result = self.verdict_of(result) if result else "ERROR"
+                if self.cam2Result != "PASS":
+                    problems.append(f"Camera 2 {self.cam2Result}: "
+                                    f"{result.error if result else out.get('cam2_error')}")
                 print(f"[CAM2] {part_number}: {self.cam2Result} "
-                      f"({(result.seen or result.error) if result else out.get('error')})")
-            then()
+                      f"({(result.seen or result.error) if result else out.get('cam2_error')})")
+            self.update_cam2_status(self.cam2Result)
+
+            # Say so at once; the part is failed when the test is saved
+            if problems:
+                self.safe_update_message("  |  ".join(problems), "red")
+            self.camera_checks_done = True
+            then, self.after_camera_checks_do = self.after_camera_checks_do, None
+            if then:
+                then()
 
         wait()
+
+    def after_camera_checks(self, then):
+        """Call `then` once this test's camera checks are in.
+
+        They normally finish long before the PLC does. If the result comes
+        first, saving waits for them; if they never started, they run now.
+        """
+        if self.camera_checks_done:
+            then()
+            return
+        self.after_camera_checks_do = then
+        if not self.camera_check_running:
+            self.start_camera_checks()
+        # Checks that could not run at all count as done straight away
+        if self.camera_checks_done and self.after_camera_checks_do:
+            self.after_camera_checks_do = None
+            then()
 
     def connect_to_plc(self):
         """Connect to PLC using configuration from .env file"""
@@ -1756,9 +1832,9 @@ class EOLTesterGUI:
                     self.endingNGCableValidated = False
                     self.log_operator_action("NG_CHECK_END_FAILED", "Known-bad cable passed every device")
             else:
-                # Camera 2 looks at the stripes while the part is still in
-                # the fixture; the part is saved once that verdict is in
-                self.run_camera_checks(self.finish_test_cycle)
+                # The cameras checked the part as the test started; it is
+                # saved once their verdicts are in
+                self.after_camera_checks(self.finish_test_cycle)
                 return
 
         except Exception as e:
@@ -3340,6 +3416,10 @@ class EOLTesterGUI:
         # 2. Part-presence sensors
         # 3. Load cell/position registers
         
+        # Check the part on both cameras straight away, while the PLC runs
+        # the test
+        self.start_camera_checks()
+
         # Start real PLC monitoring process
         self.root.after(1000, self.start_real_plc_test_process)
 
@@ -3736,10 +3816,11 @@ class EOLTesterGUI:
                     f"Generated Traceability Code: {self.traceabilityCode} already exists. Saving as 'NG'.")
                 self.save_testing_data("NG")
             elif (self.passCounter == len(self.deviceToRead)
-                  and self.cam2Result not in ("NG", "ERROR")):
-                # All tests passed, and camera 2 found the right stripes or
-                # had none to check. A camera 2 error fails the part too:
-                # its stripes were never confirmed.
+                  and self.cam2Result not in ("NG", "ERROR")
+                  and not (self.cam1_by_app and self.cam1Result in ("NG", "ERROR"))):
+                # All tests passed, and each camera the app checked passed
+                # too, or had nothing to check. A camera error fails the part
+                # as well: what it looks for was never confirmed.
                 self.save_testing_data("OK")
                 # Print barcode if configured
                 if self.barcodePrintFileName and self.barcodePrintFileName != "NO_BARCODE_PRINT_FILE":
@@ -3850,6 +3931,10 @@ class EOLTesterGUI:
             self.cam1_view.resume()
         self.cam2Result = ""
         self.cam1Image = self.cam2Image = None
+        # The next test checks its part afresh
+        self.camera_checks_done = False
+        self.after_camera_checks_do = None
+        self.cam1_by_app = False
         if hasattr(self, 'cam2_view'):
             self.cam2_view.set_status("STATUS", self.SKY)
             self.cam2_view.resume()
