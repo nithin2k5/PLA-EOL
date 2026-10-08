@@ -133,12 +133,9 @@ class MainConsole(tk.Tk):
     STALE_TEST_WARNING_DAYS = 2
     # Share of the window width given to the side navigation.
     NAV_SHARE = 0.05
-    # The tab on the navigation's edge that slides it away and back.
+    # The tab on the navigation's edge that puts it away and brings it back.
     NAV_TAB_WIDTH = 22
     NAV_TAB_HEIGHT = 64
-    # How long the slide takes, and in how many steps.
-    NAV_SLIDE_MS = 200
-    NAV_SLIDE_STEPS = 12
 
     def __init__(self):
         super().__init__()
@@ -202,7 +199,7 @@ class MainConsole(tk.Tk):
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
 
-        # Pages are built in here, filling the window; the navigation slides
+        # Pages are built in here, filling the window; the navigation lies
         # over them. Propagation is off so that a console laid out wider
         # than the window cannot stretch it.
         self.body = body
@@ -304,9 +301,8 @@ class MainConsole(tk.Tk):
     def build_nav_drawer(self, parent):
         """The navigation, laid over the page's left edge, and its tab.
 
-        It slides over the page rather than taking width from it: moving one
-        panel is smooth, where resizing the page at every step of the slide
-        made the whole console redraw and judder.
+        It lies over the page rather than taking width from it, so showing
+        or hiding it never makes the page lay itself out again.
         """
         self.nav_width = max(60, round(self.winfo_screenwidth() * self.NAV_SHARE))
         self.nav = self.build_side_nav(parent)
@@ -328,38 +324,32 @@ class MainConsole(tk.Tk):
         self.nav_tab.pack()
 
         self.nav_open = True
-        self.place_nav(1)
-
-    def place_nav(self, shown):
-        """Put the navigation `shown` of the way out (0 hidden, 1 fully out)."""
-        x = round(-self.nav_width * (1 - shown))
-        self.nav.place(x=x, y=0, relheight=1, width=self.nav_width)
-        self.nav_tab_holder.place(x=x + self.nav_width, rely=0.5, anchor='w')
+        self.nav.place(x=0, y=0, relheight=1, width=self.nav_width)
+        self.nav_tab_holder.place(x=self.nav_width, rely=0.5, anchor='w')
         self.nav.lift()
         self.nav_tab_holder.lift()
 
+    def place_nav(self, shown):
+        """Show the navigation, or put it away leaving only its tab.
+
+        It jumps rather than slides: Tk on Windows redraws everything
+        beneath a moving panel at every step, and no timing made that look
+        smooth. A single move is one clean redraw. Only the x position
+        changes, and both pieces are drawn together, so the tab never lags
+        behind the edge it sits on.
+        """
+        x = 0 if shown else -self.nav_width
+        self.nav.place_configure(x=x)
+        self.nav_tab_holder.place_configure(x=x + self.nav_width)
+        self.update_idletasks()
+
     def toggle_nav(self):
-        """Slide the navigation away, or back, with the tab on its edge."""
-        if getattr(self, '_nav_sliding', False):
-            return
+        """Put the navigation away, or bring it back, with the tab on its edge."""
         self.nav_open = not self.nav_open
         self.nav_tab.configure(image=ui.icon_image(
             'triangle_left' if self.nav_open else 'triangle_right',
             ui.TEXT_ON_DARK, 16))
-        self._nav_sliding = True
-
-        steps = self.NAV_SLIDE_STEPS
-
-        def step(n):
-            # Eased, so it starts quickly and settles gently.
-            done = 1 - (1 - n / steps) ** 2
-            self.place_nav(done if self.nav_open else 1 - done)
-            if n < steps:
-                self.after(self.NAV_SLIDE_MS // steps, step, n + 1)
-            else:
-                self._nav_sliding = False
-
-        step(1)
+        self.place_nav(self.nav_open)
 
     def nav_button(self, nav, icon, label, command, danger=False):
         button = NavButton(nav, icon, label, command, danger=danger)
