@@ -1305,6 +1305,27 @@ class EOLTesterGUI:
             return
         self.start_camera_streams()
         threading.Thread(target=captures.remove_old, daemon=True).start()
+        # Once the window is up, so the warning isn't hidden behind it
+        self.root.after(1500, self.warn_cameras_not_configured)
+
+    def unconfigured_cameras(self):
+        """Names of the cameras with no device chosen, e.g. ["Camera 2"]."""
+        sources = (("Camera 1", self.camera1_source()), ("Camera 2", stripe_check.CAMERA_SOURCE))
+        return [name for name, source in sources if load_camera_config(source)[0] < 0]
+
+    def warn_cameras_not_configured(self):
+        """Tell the operator which cameras have no device chosen."""
+        missing = self.unconfigured_cameras()
+        if not missing:
+            return
+        names = " and ".join(missing)
+        verb = "are" if len(missing) > 1 else "is"
+        messagebox.showwarning(
+            "Camera Not Configured",
+            f"{names} {verb} not configured.\n\n"
+            "Click the camera's picture on this screen, or open Vision Settings, "
+            "to choose its device.",
+            parent=self.root)
 
     def start_camera_streams(self):
         """Open each camera that is set up and show it on its live view."""
