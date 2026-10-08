@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
+import customtkinter as ctk
 import os
 import mysql.connector
 import threading
@@ -26,7 +27,8 @@ from plc_address import bit_address
 try:
     import numpy as np
     from vision_engine import camera, captures, stripe_check
-    from vision_engine import VisionController, load_camera_config, load_vision_config
+    from vision_engine import (VisionController, load_camera_config, load_vision_config,
+                               save_vision_config)
 except ImportError:
     camera = captures = stripe_check = None
 
@@ -659,6 +661,42 @@ class EOLTesterGUI:
                                       font=(self.FONT, 14, 'bold'), relief='raised', bd=1,
                                       padx=18, cursor='hand2', command=self.start_test_click)
         self.start_button.pack(side='right', padx=(0, 4), pady=8)
+
+        # Whether the cameras check each part. It is Vision Settings' "Vision
+        # enabled" too, so the two agree and the choice holds on reopening.
+        # A large box, as Tk's own is too small to see at a glance on the line
+        self.vision_check_var = tk.BooleanVar(value=self.vision_check_saved())
+        self.vision_check_box = ctk.CTkCheckBox(
+            bar, text="VISION CHECK", variable=self.vision_check_var,
+            command=self.toggle_vision_check, bg_color=bar.cget('bg'),
+            fg_color=ui.SUCCESS, hover_color=ui.SUCCESS_HOVER, border_color='black',
+            text_color='black', checkbox_width=26, checkbox_height=26,
+            font=(self.FONT, 14, 'bold'))
+        self.vision_check_box.pack(side='right', padx=(0, 16), pady=8)
+        if stripe_check is None:
+            self.vision_check_var.set(False)
+            self.vision_check_box.configure(state='disabled')
+
+    @staticmethod
+    def vision_check_saved():
+        if stripe_check is None:
+            return False
+        return bool(load_vision_config().get("vision_enabled", True))
+
+    def toggle_vision_check(self):
+        """Save the VISION CHECK choice; it applies from the next test started."""
+        on = self.vision_check_var.get()
+        try:
+            cfg = load_vision_config()
+            cfg["vision_enabled"] = on
+            save_vision_config(cfg)
+        except OSError as e:
+            messagebox.showerror("Vision Check", f"Could not save the setting: {e}")
+        self.log_operator_action("VISION_CHECK", "On" if on else "Off")
+        self.safe_update_message(
+            "Vision check on - the cameras check each part." if on else
+            "Vision check off - the cameras will not check the parts.",
+            "green" if on else "red")
 
     def start_test_click(self):
         """Start a PLC test cycle on the loaded part.
@@ -1402,15 +1440,17 @@ class EOLTesterGUI:
         if getattr(self, 'startingNGCableValidation', False) or \
                 getattr(self, 'endingNGCableValidation', False):
             return      # a known-bad cable is checked by the PLC alone, and not saved
-        if stripe_check is None:
+        if stripe_check is None or not self.vision_check_var.get():
+            # VISION CHECK is off: neither camera judges the part, and
+            # camera 1 keeps the PLC's verdict
             self.cam2Result = "OFF"
+            self.update_cam2_status("OFF")
             self.camera_checks_done = True
             return
 
         part_number = self.partNumber
         vision = VisionController()
-        check_cam1 = (bool(part_number) and vision.config.get("vision_enabled", True)
-                      and vision.has_model(part_number))
+        check_cam1 = bool(part_number) and vision.has_model(part_number)
         check_cam2 = bool(part_number) and stripe_check.has_model(part_number)
         self.cam1Image = self.cam2Image = None
         self.camera_check_running = True
