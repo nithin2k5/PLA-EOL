@@ -6,7 +6,7 @@ import customtkinter as ctk
 
 import db
 import ui
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 import os
 
@@ -79,10 +79,8 @@ class DataConsole:
         body = tk.Frame(self.root, bg=ui.APP_BG)
         body.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
 
-        self.create_filter_bar(body)
         self.create_summary(body)
-        # Packed from the bottom before the table, so the table takes the rest
-        self.create_camera_panels(body)
+        self.create_filter_panel(body)
         self.create_table(body)
 
         self.load_part_numbers()
@@ -93,79 +91,117 @@ class DataConsole:
     # Layout
     # ------------------------------------------------------------------
 
-    def create_filter_bar(self, parent):
-        """Every filter and both actions on one line."""
+    def create_summary(self, parent):
+        """What is on show on the left, its totals in tiles on the right."""
+        row = tk.Frame(parent, bg=ui.APP_BG)
+        row.pack(fill=tk.X)
+
+        heading = tk.Frame(row, bg=ui.APP_BG)
+        heading.pack(side=tk.LEFT, anchor='w')
+        tk.Label(heading, text="TEST HISTORY", bg=ui.APP_BG, fg=ui.ACCENT,
+                 font=(ui.FONT_FAMILY, 20, 'bold')).pack(anchor='w')
+        # What the table is showing, so a printout or photo of it says so.
+        self.range_label = tk.Label(heading, text="", bg=ui.APP_BG, fg=ui.TEXT_MUTED,
+                                    font=(ui.FONT_FAMILY, 11, 'bold'))
+        self.range_label.pack(anchor='w')
+
+        self.stats = {}
+        # Packed from the right, so they read PARTS, PASS, NG, NG %
+        for key, title, colour in reversed((
+                ('total', "PARTS", ui.ACCENT),
+                ('pass', "PASS", ui.SUCCESS),
+                ('ng', "NG", ui.DANGER),
+                ('rate', "NG %", ui.WARNING))):
+            tile = ui.ctk_card(row, width=120, height=72)
+            tile.pack(side=tk.RIGHT, padx=(ui.PAD, 0))
+            tile.pack_propagate(False)
+
+            value = ctk.CTkLabel(tile, text=BLANK, text_color=colour,
+                                 font=(ui.FONT_FAMILY, 22, 'bold'))
+            value.pack(pady=(ui.PAD, 0))
+            ctk.CTkLabel(tile, text=title, text_color=ui.TEXT_MUTED,
+                         font=(ui.FONT_FAMILY, 11, 'bold')).pack()
+            self.stats[key] = value
+
+    def create_filter_panel(self, parent):
+        """The filters and quick ranges, the actions, then both cameras' pictures."""
         card = ui.ctk_card(parent)
-        card.pack(fill=tk.X)
+        card.pack(fill=tk.X, pady=(ui.PAD_LARGE, 0))
 
-        bar = tk.Frame(card, bg=ui.SURFACE)
-        bar.pack(fill=tk.X, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
+        panel = tk.Frame(card, bg=ui.SURFACE)
+        panel.pack(fill=tk.X, padx=ui.PAD_LARGE, pady=ui.PAD_LARGE)
 
-        def label(text, column):
-            tk.Label(bar, text=text, bg=ui.SURFACE, fg=ui.TEXT,
-                     font=ui.FONT_BODY_BOLD).grid(
-                         row=0, column=column, sticky="e",
-                         padx=(ui.PAD_LARGE if column else 0, ui.PAD))
+        self.create_filters(panel)
 
-        label("PART NUMBER", 0)
-        self.part_combobox = ttk.Combobox(bar, state="readonly", width=13)
-        self.part_combobox.grid(row=0, column=1)
+        tk.Frame(panel, bg=ui.BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y,
+                                                    padx=ui.PAD_LARGE)
+
+        actions = tk.Frame(panel, bg=ui.SURFACE)
+        actions.pack(side=tk.LEFT, anchor='n')
+        self.search_button = ui.ctk_button(actions, text="Search", icon='clipboard',
+                                           kind='primary', width=170, height=40,
+                                           command=self.search_records)
+        self.search_button.pack(pady=(ui.PAD_LARGE, ui.PAD))
+        self.export_button = ui.ctk_button(actions, text="Export CSV", icon='download',
+                                           kind='success', width=170, height=40,
+                                           command=self.export_to_csv)
+        self.export_button.pack()
+
+        tk.Frame(panel, bg=ui.BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y,
+                                                    padx=ui.PAD_LARGE)
+
+        self.create_camera_panels(panel)
+
+    def create_filters(self, parent):
+        """Part number, result and dates over the quick date ranges."""
+        box = tk.Frame(parent, bg=ui.SURFACE)
+        box.pack(side=tk.LEFT, anchor='n')
+
+        def field(column, text, widget):
+            tk.Label(box, text=text, bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                     font=(ui.FONT_FAMILY, 10, 'bold')).grid(
+                         row=0, column=column, sticky='w',
+                         padx=(0 if column == 0 else ui.PAD_LARGE, 0))
+            widget.grid(row=1, column=column, sticky='w',
+                        padx=(0 if column == 0 else ui.PAD_LARGE, 0), pady=(2, 0))
+
+        self.part_combobox = ttk.Combobox(box, state="readonly", width=16)
+        field(0, "PART NUMBER", self.part_combobox)
+
+        self.result_combobox = ttk.Combobox(box, state="readonly", width=8,
+                                            values=["ALL", "PASS", "NG"])
+        self.result_combobox.set("ALL")
+        field(1, "RESULT", self.result_combobox)
 
         # Start at the beginning of the current month, end today.
         current_date = datetime.now()
-        start_of_month = current_date.replace(day=1)
+        self.start_date_entry = self.date_entry(box, current_date)
+        self.start_date_entry.set_date(current_date.replace(day=1))
+        field(2, "START DATE", self.start_date_entry)
 
-        label("FROM", 2)
-        self.start_date_entry = self.date_entry(bar, current_date)
-        self.start_date_entry.grid(row=0, column=3)
-        self.start_date_entry.set_date(start_of_month)
-
-        label("TO", 4)
-        self.end_date_entry = self.date_entry(bar, current_date)
-        self.end_date_entry.grid(row=0, column=5)
+        self.end_date_entry = self.date_entry(box, current_date)
         self.end_date_entry.set_date(current_date)
+        field(3, "END DATE", self.end_date_entry)
 
-        label("RESULT", 6)
-        self.result_combobox = ttk.Combobox(bar, state="readonly", width=8,
-                                            values=["ALL", "PASS", "NG"])
-        self.result_combobox.grid(row=0, column=7)
-        self.result_combobox.set("ALL")
+        quick = tk.Frame(box, bg=ui.SURFACE)
+        quick.grid(row=2, column=0, columnspan=4, sticky='w', pady=(ui.PAD_LARGE * 2, 0))
+        tk.Label(quick, text="QUICK", bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                 font=(ui.FONT_FAMILY, 10, 'bold')).pack(side=tk.LEFT, padx=(0, ui.PAD))
+        for text, days in (("TODAY", 0), ("7 DAYS", 6), ("30 DAYS", 29), ("THIS MONTH", None)):
+            tk.Button(quick, text=text, bg=ui.ACCENT_SOFT, fg=ui.ACCENT,
+                      activebackground=ui.ACCENT_FILL, relief='flat', bd=0,
+                      cursor='hand2', font=(ui.FONT_FAMILY, 10, 'bold'),
+                      padx=10, pady=3,
+                      command=lambda d=days: self.quick_range(d)).pack(
+                          side=tk.LEFT, padx=(0, ui.PAD))
 
-        label("STATUS", 8)
-        self.status_combobox = ttk.Combobox(bar, state="readonly", width=9,
-                                            values=["ACTIVE", "INACTIVE"])
-        self.status_combobox.grid(row=0, column=9)
-        self.status_combobox.set("ACTIVE")
-
-        # The actions sit at the right-hand end, however wide the window is.
-        bar.grid_columnconfigure(10, weight=1)
-
-        actions = tk.Frame(bar, bg=ui.SURFACE)
-        self.search_button = ui.ctk_button(actions, text="Search", icon='clipboard',
-                                           kind='primary', width=120,
-                                           command=self.search_records)
-        self.search_button.pack(side=tk.LEFT, padx=(0, ui.PAD))
-
-        self.export_button = ui.ctk_button(actions, text="Export CSV", icon='download',
-                                           kind='success', width=130,
-                                           command=self.export_to_csv)
-        self.export_button.pack(side=tk.LEFT)
-
-        def place_actions(event=None):
-            # Beside the filters when they fit, otherwise on a line of their
-            # own under them - never cut off the right-hand edge.
-            filters = sum(child.winfo_reqwidth() for child in bar.grid_slaves(row=0)
-                          if child is not actions) + 9 * ui.PAD_LARGE
-            wide = bar.winfo_width() >= filters + actions.winfo_reqwidth() + ui.PAD_LARGE
-            where = (dict(row=0, column=11, columnspan=1, sticky="e",
-                          padx=(ui.PAD_LARGE, 0), pady=0) if wide else
-                     dict(row=1, column=0, columnspan=12, sticky="e",
-                          padx=0, pady=(ui.PAD, 0)))
-            if actions.grid_info().get("row") != where["row"]:
-                actions.grid(**where)
-
-        actions.grid(row=0, column=11, sticky="e", padx=(ui.PAD_LARGE, 0))
-        bar.bind("<Configure>", place_actions, add="+")
+    def quick_range(self, days):
+        """Search the last `days` days besides today, or this month when None."""
+        today = datetime.now()
+        start = today.replace(day=1) if days is None else today - timedelta(days=days)
+        self.start_date_entry.set_date(start)
+        self.end_date_entry.set_date(today)
+        self.search_records()
 
     def date_entry(self, parent, max_date):
         return DateEntry(parent,
@@ -182,42 +218,9 @@ class DataConsole:
                          selectmode='day',
                          cursor='hand2')
 
-    def create_summary(self, parent):
-        """A row of totals for the search on show."""
-        row = tk.Frame(parent, bg=ui.APP_BG)
-        row.pack(fill=tk.X, pady=(ui.PAD_LARGE, 0))
-
-        self.stats = {}
-        for column, (key, title, colour) in enumerate((
-                ('total', "RECORDS", ui.ACCENT),
-                ('pass', "PASS", ui.SUCCESS),
-                ('ng', "NG", ui.DANGER),
-                ('rate', "PASS RATE", ui.ACCENT))):
-            row.grid_columnconfigure(column, weight=1, uniform='stats')
-
-            tile = ui.ctk_card(row, height=66)
-            tile.grid(row=0, column=column, sticky="ew",
-                      padx=(0 if column == 0 else ui.PAD, 0))
-            tile.pack_propagate(False)
-
-            ctk.CTkLabel(tile, text=title, text_color=ui.TEXT_MUTED,
-                         font=(ui.FONT_FAMILY, 11, 'bold')).pack(
-                             anchor='w', padx=ui.PAD_LARGE, pady=(ui.PAD, 0))
-            value = ctk.CTkLabel(tile, text=BLANK, text_color=colour,
-                                 font=(ui.FONT_FAMILY, 22, 'bold'))
-            value.pack(anchor='w', padx=ui.PAD_LARGE)
-            self.stats[key] = value
-
     def create_table(self, parent):
         table_card = ui.ctk_card(parent)
         table_card.pack(fill=tk.BOTH, expand=True, pady=(ui.PAD_LARGE, 0))
-
-        header = ui.ctk_card_header(table_card, "RESULTS", icon='list')
-        # What the table is showing, so a printout or photo of it says so.
-        self.range_label = ctk.CTkLabel(header, text="", fg_color=ui.NAVY,
-                                        text_color=ui.ACCENT_SOFT,
-                                        font=ui.FONT_SMALL)
-        self.range_label.pack(side='right', padx=ui.PAD_LARGE)
 
         table_frame = tk.Frame(table_card, bg=ui.SURFACE)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE,
@@ -260,30 +263,29 @@ class DataConsole:
 
     def create_camera_panels(self, parent):
         """CAMERA 1 and CAMERA 2: what each camera saw of the selected test."""
-        row = tk.Frame(parent, bg=ui.APP_BG, height=290)
-        row.pack(side=tk.BOTTOM, fill=tk.X, pady=(ui.PAD_LARGE, 0))
-        # A fixed height, so a picture never pushes the table off the page
-        row.grid_propagate(False)
-        row.grid_rowconfigure(0, weight=1)
-
         self.camera_panels = {}
-        for column, (key, title) in enumerate((("CAM1", "CAMERA 1"), ("CAM2", "CAMERA 2"))):
-            row.grid_columnconfigure(column, weight=1, uniform='camera')
-            card = ui.ctk_card(row)
-            card.grid(row=0, column=column, sticky="nsew",
-                      padx=(0 if column == 0 else ui.PAD_LARGE, 0))
-            header = ui.ctk_card_header(card, title, icon='camera')
-            # A badge in the verdict's colour, as on the test console's tiles
-            verdict = ctk.CTkLabel(header, text="", fg_color=ui.NAVY, width=70,
-                                   corner_radius=ui.CORNER_RADIUS_SMALL,
-                                   text_color=ui.TEXT_ON_DARK,
-                                   font=(ui.FONT_FAMILY, 13, 'bold'))
-            verdict.pack(side='right', padx=ui.PAD_LARGE, pady=4)
+        for key, title in (("CAM1", "CAMERA 1"), ("CAM2", "CAMERA 2")):
+            box = tk.Frame(parent, bg=ui.SURFACE)
+            box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                     padx=(0 if key == "CAM1" else ui.PAD_LARGE, 0))
 
-            picture = tk.Label(card, bg=ui.SUBTLE, fg=ui.TEXT_MUTED,
-                               font=ui.FONT_BODY, text="Select a result to see its picture")
-            picture.pack(fill=tk.BOTH, expand=True, padx=ui.PAD_LARGE,
-                         pady=(ui.PAD, ui.PAD_LARGE))
+            caption = tk.Frame(box, bg=ui.SURFACE)
+            caption.pack(fill=tk.X)
+            tk.Label(caption, text=title, bg=ui.SURFACE, fg=ui.TEXT_MUTED,
+                     font=(ui.FONT_FAMILY, 10, 'bold')).pack(side=tk.LEFT)
+            # A badge in the verdict's colour, as on the test console's tiles
+            verdict = tk.Label(caption, text="", bg=ui.SURFACE, fg=ui.TEXT_ON_DARK,
+                               font=(ui.FONT_FAMILY, 10, 'bold'), padx=8)
+            verdict.pack(side=tk.RIGHT)
+
+            # A fixed height, so a picture never pushes the table off the page
+            frame = tk.Frame(box, bg=ui.SUBTLE, height=170,
+                             highlightbackground=ui.BORDER, highlightthickness=1)
+            frame.pack(fill=tk.X, pady=(2, 0))
+            frame.pack_propagate(False)
+            picture = tk.Label(frame, bg=ui.SUBTLE, fg=ui.TEXT_MUTED,
+                               font=ui.FONT_BODY, text="Select a row")
+            picture.pack(fill=tk.BOTH, expand=True)
             panel = {"verdict": verdict, "picture": picture, "image": None, "photo": None}
             # Fit the picture again whenever the panel changes size
             picture.bind("<Configure>", lambda e, p=panel: self.fit_picture(p))
@@ -297,12 +299,12 @@ class DataConsole:
             verdict, picture = cameras[key] if cameras else ("", None)
             panel["verdict"].configure(
                 text=verdict or "",
-                fg_color=VERDICT_COLOURS.get(str(verdict).upper(), ui.NAVY))
+                bg=VERDICT_COLOURS.get(str(verdict).upper(), ui.NAVY) if verdict else ui.SURFACE)
             panel["image"] = captures.load(picture) if captures and picture else None
             if panel["image"] is None:
                 panel["photo"] = None
                 if not cameras:
-                    note = "Select a result to see its picture"
+                    note = "Select a row"
                 elif picture and captures:
                     note = "This picture is no longer kept"
                 else:
@@ -439,9 +441,10 @@ class DataConsole:
             self.result_table.selection_set(rows[0])
         self.show_cameras()
 
-        self.range_label.configure(text="{} to {}{}".format(
-            start.strftime('%d-%m-%Y'), end.strftime('%d-%m-%Y'),
-            "" if part_number in ("", "ALL") else "  ·  " + part_number))
+        self.range_label.configure(text="{}  ·  {}  ·  {} TO {}".format(
+            "ALL PARTS" if part_number in ("", "ALL") else part_number,
+            "ALL RESULTS" if result_filter in ("", "ALL") else result_filter,
+            start.strftime('%d-%m-%Y'), end.strftime('%d-%m-%Y')))
         self.show_summary(records)
 
         if records:
@@ -458,7 +461,7 @@ class DataConsole:
         self.stats['pass'].configure(text=str(passed))
         self.stats['ng'].configure(text=str(failed))
         self.stats['rate'].configure(
-            text="{:.1f} %".format(100.0 * passed / total) if total else BLANK)
+            text="{:.1f}".format(100.0 * failed / total) if total else BLANK)
 
     def export_to_csv(self):
         """Export table data to CSV file"""
