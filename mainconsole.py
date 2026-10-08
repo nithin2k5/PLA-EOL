@@ -137,8 +137,8 @@ class MainConsole(tk.Tk):
     def __init__(self):
         super().__init__()
         ui.apply(self)
-        db.init_database()
         self.title("EOL Tester")
+        self.connect_database()
         self.state('zoomed')  # Start maximized
 
         # A clock behind the last recorded test would misdate new results.
@@ -148,6 +148,39 @@ class MainConsole(tk.Tk):
 
         self.setup_ui()
         
+    def connect_database(self):
+        """Set up the database, saying plainly when it can't be reached.
+
+        Returns True once it is ready. Without it nothing can be tested or
+        saved, so the operator can retry - after starting MySQL, say - or
+        open the app anyway to reach the pages that don't need it.
+        """
+        while True:
+            try:
+                db.init_database(raise_on_error=True)
+                return True
+            except Exception as e:
+                code = getattr(e, 'errno', None)
+                if code in (2003, 2005):
+                    reason = ("The MySQL server could not be reached. Check that MySQL "
+                              "is running on this computer.")
+                elif code == 1045:
+                    reason = ("MySQL refused the user name or password. Check the "
+                              "USER and PASSWORD in db.py.")
+                else:
+                    reason = "MySQL reported a problem."
+                retry = messagebox.askretrycancel(
+                    "Database Connection Failed",
+                    f"{reason}\n\n"
+                    f"Server: {db.HOST}:{db.PORT}    User: {db.USER}    "
+                    f"Database: {db.DATABASE}\n"
+                    f"Error: {e}\n\n"
+                    "Retry to try again, or Cancel to open without the database - "
+                    "testing and saving results will not work until it connects.",
+                    parent=self)
+                if not retry:
+                    return False
+
     def setup_ui(self):
         # Set the main window to full screen
         self.state('zoomed')
