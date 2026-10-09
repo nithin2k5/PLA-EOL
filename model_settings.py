@@ -1363,10 +1363,10 @@ class WorkspaceApp:
                 )
                 return
             
-            # Part details, specifications and labels all need to be complete
+            # Part details and specifications need to be complete. Labels on
+            # the image are optional: a part may have no sensors to show.
             if not (self.validate_part_details()
-                    and self.validate_spec_details()
-                    and self.validate_label_details()):
+                    and self.validate_spec_details()):
                 return
             
             # Collect other data
@@ -1713,20 +1713,6 @@ class WorkspaceApp:
             )
             return False
         return True
-
-    def validate_label_details(self):
-        """At least one label needs a status before the part can be saved."""
-        for item in self.tree.get_children():
-            values = self.tree.item(item, 'values')
-            if len(values) > 1 and str(values[1]).strip():
-                return True
-
-        messagebox.showwarning(
-            "Input Error",
-            "Please make sure at least one label information is filled "
-            "under Label Details section..."
-        )
-        return False
 
     def check_alc_exists(self, alc_code, ignore_part_number=None):
         """True when another part already claims this ALC code.
