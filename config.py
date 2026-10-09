@@ -86,12 +86,12 @@ DEFAULTS = {
         'ENABLE_CONSOLE_OUTPUT': 'true',
     },
     'Files': {
-        'INPUT_SENSORS_FILE': 'txt_files/InputSensors.txt',
-        'PROCESS_STATUS_FILE': 'txt_files/ProcessStatus.txt',
-        'INPUT_REGISTERS_FILE': 'txt_files/HoldRegistersRead.txt',
-        'MACHINE_ON_PLC_ADDRESS_FILE': 'txt_files/MachineOnPLCCoilAddress.txt',
-        'ALERT_ON_PLC_ADDRESS_FILE': 'txt_files/AlertOnPLCCoilAddress.txt',
-        'EMPLOYEE_CODES_FILE': 'txt_files/EmployeeCodes.txt',
+        'INPUT_SENSORS_FILE': 'InputSensors.txt',
+        'PROCESS_STATUS_FILE': 'ProcessStatus.txt',
+        'INPUT_REGISTERS_FILE': 'InputRegisters.txt',
+        'MACHINE_ON_PLC_ADDRESS_FILE': 'MachineOnPLCCoilAddress.txt',
+        'ALERT_ON_PLC_ADDRESS_FILE': 'AlertOnPLCCoilAddress.txt',
+        'EMPLOYEE_CODES_FILE': 'EmployeeCodes.txt',
     },
     'Screen': {
         'SCREEN_WIDTH': '1920',

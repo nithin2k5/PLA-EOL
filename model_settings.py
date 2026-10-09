@@ -4,6 +4,7 @@ from PIL import Image, ImageTk
 import json
 import mysql.connector
 
+import data_files
 import db
 import ui
 from datetime import datetime
@@ -1992,8 +1993,7 @@ class WorkspaceApp:
     def load_plc_options(self, ignore_part_number=None):
         """Load the PLC addresses that are still free to assign."""
         try:
-            # Use file in txt_files directory
-            file_path = "txt_files/ProgramSelectionInPLC.txt"
+            file_path = data_files.path(data_files.PROGRAM_SELECTION_IN_PLC)
             with open(file_path, 'r') as file:
                 content = file.read().strip()
                 options = [opt.strip() for opt in content.split(',') if opt.strip()]
@@ -2009,17 +2009,16 @@ class WorkspaceApp:
             return []
 
     def load_barcode_options(self):
-        """Load barcode options from txt_files/barcodeprintfilenames.txt"""
+        """Load barcode options from BarcodePrintFileNames.txt"""
         try:
-            # Use file in txt_files directory
-            file_path = "txt_files/barcodeprintfilenames.txt"
+            file_path = data_files.path(data_files.BARCODE_PRINT_FILE_NAMES)
             with open(file_path, 'r') as file:
                 content = file.read().strip()
                 options = [opt.strip() for opt in content.split(',') if opt.strip()]
                 print(f"Loaded barcode options: {options}")
                 return options
         except FileNotFoundError:
-            print(f"Warning: barcodeprintfilenames.txt not found at {file_path}")
+            print(f"Warning: BarcodePrintFileNames.txt not found at {file_path}")
             return []
         except Exception as e:
             print(f"Error reading barcode options: {str(e)}")

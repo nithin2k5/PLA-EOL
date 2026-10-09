@@ -11,6 +11,7 @@ import os
 import time
 import threading
 import config
+import data_files
 import ui
 from plc_address import bit_address
 import json
@@ -436,13 +437,9 @@ class ComPortSettings:
             # Clear the text box
             self.rx_text.delete("1.0", tk.END)
             
-            # Define file paths in txt_files directory
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            txt_files_dir = os.path.join(current_dir, "txt_files")
-            
-            process_status_file = os.path.join(txt_files_dir, "ProcessStatus.txt")
-            input_sensors_file = os.path.join(txt_files_dir, "InputSensors.txt")
-            program_selection_file = os.path.join(txt_files_dir, "ProgramSelectionInPLC.txt")
+            process_status_file = data_files.path(data_files.PROCESS_STATUS)
+            input_sensors_file = data_files.path(data_files.INPUT_SENSORS)
+            program_selection_file = data_files.path(data_files.PROGRAM_SELECTION_IN_PLC)
             
             # Initialize arrays
             process_status_array = []
@@ -457,7 +454,7 @@ class ComPortSettings:
             ]:
                 try:
                     if not os.path.exists(file_path):
-                        self.rx_text.insert(tk.END, f"Warning: {os.path.basename(file_path)} not found in txt_files directory\n")
+                        self.rx_text.insert(tk.END, f"Warning: {os.path.basename(file_path)} not found at {file_path}\n")
                         continue
                         
                     with open(file_path, 'r') as f:
@@ -1141,9 +1138,7 @@ class ComPortSettings:
     def load_plc_options(self):
         """Load PLC address options from plc_register.txt"""
         try:
-            # Use path in txt_files directory
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            file_path = os.path.join(current_dir, "txt_files", "PLC_on_register.txt")
+            file_path = data_files.path(data_files.PLC_ON_REGISTER)
             
             with open(file_path, 'r') as file:
                 # Read content and split by commas
@@ -1152,18 +1147,16 @@ class ComPortSettings:
                 print(f"Loaded PLC options: {options}")  # Debug print
                 return options
         except FileNotFoundError:
-            print(f"Warning: PLC_on_register.txt not found in txt_files directory at {file_path}")
+            print(f"Warning: PLC_on_register.txt not found at {file_path}")
             return []
         except Exception as e:
             print(f"Error reading PLC options: {str(e)}")
             return []
 
     def load_barcode_options(self):
-        """Load barcode options from barcodeprintfilename.txt"""
+        """Load barcode options from BarcodePrintFileNames.txt"""
         try:
-            # Use path in txt_files directory
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            file_path = os.path.join(current_dir, "txt_files", "barcodeprintfilenames.txt")
+            file_path = data_files.path(data_files.BARCODE_PRINT_FILE_NAMES)
             
             with open(file_path, 'r') as file:
                 # Read content and split by commas
@@ -1172,7 +1165,7 @@ class ComPortSettings:
                 print(f"Loaded barcode options: {options}")  # Debug print
                 return options
         except FileNotFoundError:
-            print(f"Warning: barcodeprintfilenames.txt not found in txt_files directory at {file_path}")
+            print(f"Warning: BarcodePrintFileNames.txt not found at {file_path}")
             return []
         except Exception as e:
             print(f"Error reading barcode options: {str(e)}")

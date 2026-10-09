@@ -17,6 +17,7 @@ import queue
 import math
 
 import config
+import data_files
 import db
 import ui
 from plc_address import bit_address
@@ -2179,18 +2180,10 @@ class EOLTesterGUI:
         print("Database tables created/verified successfully")
 
     def load_configuration_data(self):
-        """Load configuration data from txt_files subdirectory"""
+        """Load the PLC addresses and employee codes from the data files"""
         try:
-            # Define the subdirectory path
-            txt_files_dir = os.path.join(os.path.dirname(__file__), 'txt_files')
-            
-            # Ensure the directory exists
-            if not os.path.exists(txt_files_dir):
-                os.makedirs(txt_files_dir, exist_ok=True)
-                print(f"Created txt_files directory at: {txt_files_dir}")
-            
             # Load ProcessStatus
-            process_status_path = os.path.join(txt_files_dir, 'ProcessStatus.txt')
+            process_status_path = data_files.path(data_files.PROCESS_STATUS)
             if os.path.exists(process_status_path):
                 with open(process_status_path, 'r') as file:
                     self.process_status_array = [line.strip() for line in file.readlines()]
@@ -2199,7 +2192,7 @@ class EOLTesterGUI:
                 self.process_status_array = []
             
             # Load ProgramSelectionInPLC
-            program_selection_path = os.path.join(txt_files_dir, 'ProgramSelectionInPLC.txt')
+            program_selection_path = data_files.path(data_files.PROGRAM_SELECTION_IN_PLC)
             if os.path.exists(program_selection_path):
                 with open(program_selection_path, 'r') as file:
                     self.program_selection_array = [line.strip() for line in file.readlines()]
@@ -2208,7 +2201,7 @@ class EOLTesterGUI:
                 self.program_selection_array = []
             
             # Load InputSensors
-            input_sensors_path = os.path.join(txt_files_dir, 'InputSensors.txt')
+            input_sensors_path = data_files.path(data_files.INPUT_SENSORS)
             if os.path.exists(input_sensors_path):
                 with open(input_sensors_path, 'r') as file:
                     self.input_sensors_array = [line.strip() for line in file.readlines()]
@@ -2217,7 +2210,7 @@ class EOLTesterGUI:
                 self.input_sensors_array = []
             
             # Load EmployeeCodes
-            employee_codes_path = os.path.join(txt_files_dir, 'EmployeeCodes.txt')
+            employee_codes_path = data_files.path(data_files.EMPLOYEE_CODES)
             if os.path.exists(employee_codes_path):
                 with open(employee_codes_path, 'r') as file:
                     self.employee_codes = [line.strip() for line in file.readlines()]
@@ -2225,8 +2218,8 @@ class EOLTesterGUI:
                 print(f"Warning: EmployeeCodes.txt not found at {employee_codes_path}")
                 self.employee_codes = []
             
-            # Load PLC On Register file - updated to txt_files directory
-            plc_register_path = os.path.join(txt_files_dir, 'PLC_on_register.txt')
+            # Load PLC On Register file
+            plc_register_path = data_files.path(data_files.PLC_ON_REGISTER)
             if os.path.exists(plc_register_path):
                 with open(plc_register_path, 'r') as file:
                     # Process the file content as needed
@@ -2234,17 +2227,17 @@ class EOLTesterGUI:
             else:
                 print(f"Warning: PLC_on_register.txt not found at {plc_register_path}")
             
-            # Load barcode print filenames - updated to txt_files directory
-            barcode_print_path = os.path.join(txt_files_dir, 'barcodeprintfilenames.txt')
+            # Load barcode print filenames
+            barcode_print_path = data_files.path(data_files.BARCODE_PRINT_FILE_NAMES)
             if os.path.exists(barcode_print_path):
                 with open(barcode_print_path, 'r') as file:
                     # Process the file content as needed
                     print(f"Loaded barcode print filenames from: {barcode_print_path}")
             else:
-                print(f"Warning: barcodeprintfilenames.txt not found at {barcode_print_path}")
+                print(f"Warning: BarcodePrintFileNames.txt not found at {barcode_print_path}")
             
             # Load Machine On PLC Coil Address
-            machine_on_path = os.path.join(txt_files_dir, 'MachineOnPLCCoilAddress.txt')
+            machine_on_path = data_files.path(data_files.MACHINE_ON_PLC_COIL_ADDRESS)
             if os.path.exists(machine_on_path):
                 with open(machine_on_path, 'r') as file:
                     self.machineOnPLCCoilAddress = file.read().strip()
@@ -2255,7 +2248,7 @@ class EOLTesterGUI:
                 self.machineOnPLCCoilAddress = ""
             
             # Load Alert On PLC Coil Address
-            alert_on_path = os.path.join(txt_files_dir, 'AlertOnPLCCoilAddress.txt')
+            alert_on_path = data_files.path(data_files.ALERT_ON_PLC_COIL_ADDRESS)
             if os.path.exists(alert_on_path):
                 with open(alert_on_path, 'r') as file:
                     self.alertOnPLCCoilAddress = file.read().strip()
@@ -2269,7 +2262,7 @@ class EOLTesterGUI:
                        self.input_sensors_array, self.employee_codes]):
                 print("Warning: One or more configuration files are empty or not found.")
                 # Only try to update message_label if it exists and the window is valid
-                self.safe_update_message("Warning: Some configuration files not found. Check txt_files directory.", "orange")
+                self.safe_update_message("Warning: Some configuration files not found. Check the project folder.", "orange")
             
         except FileNotFoundError as e:
             print(f"File Not Found: {str(e)}")
@@ -2279,10 +2272,9 @@ class EOLTesterGUI:
             self.safe_update_message(f"Error loading configuration data: {str(e)}", "red")
 
     def load_authorized_employee_codes(self):
-        """Load authorized employee codes from txt_files/EmployeeCodes.txt"""
+        """Load authorized employee codes from EmployeeCodes.txt"""
         try:
-            txt_files_dir = os.path.join(os.path.dirname(__file__), 'txt_files')
-            employee_codes_path = os.path.join(txt_files_dir, 'EmployeeCodes.txt')
+            employee_codes_path = data_files.path(data_files.EMPLOYEE_CODES)
             
             if os.path.exists(employee_codes_path):
                 with open(employee_codes_path, 'r') as file:
@@ -2429,10 +2421,9 @@ class EOLTesterGUI:
             return {}
 
     def load_hold_register_addresses(self):
-        """Load hold register addresses from HoldRegistersRead.txt file"""
+        """Load hold register addresses from InputRegisters.txt file"""
         try:
-            txt_files_dir = os.path.join(os.path.dirname(__file__), 'txt_files')
-            hold_registers_file = os.path.join(txt_files_dir, 'HoldRegistersRead.txt')
+            hold_registers_file = data_files.path(data_files.INPUT_REGISTERS)
             
             if os.path.exists(hold_registers_file):
                 with open(hold_registers_file, 'r') as file:
@@ -2447,7 +2438,7 @@ class EOLTesterGUI:
             else:
                 # Default addresses if file doesn't exist
                 self.hold_register_addresses = ["D001", "D002", "D003", "D004", "D005", "D006", "D007", "D008"]
-                print("HoldRegistersRead.txt not found, using default addresses")
+                print("InputRegisters.txt not found, using default addresses")
                 
         except Exception as e:
             print(f"Error loading hold register addresses: {e}")
@@ -2456,9 +2447,7 @@ class EOLTesterGUI:
     def load_process_addresses(self):
         """Load process addresses from ProcessStatus.txt file"""
         try:
-            # Get the txt_files directory path
-            txt_files_dir = os.path.join(os.path.dirname(__file__), 'txt_files')
-            process_status_file = os.path.join(txt_files_dir, 'ProcessStatus.txt')
+            process_status_file = data_files.path(data_files.PROCESS_STATUS)
             
             if os.path.exists(process_status_file):
                 with open(process_status_file, 'r') as file:
@@ -2881,16 +2870,8 @@ class EOLTesterGUI:
             return
         
         try:
-            # Use the correct path in txt_files subdirectory
-            txt_files_dir = os.path.join(os.path.dirname(__file__), 'txt_files')
-            
-            # Ensure the directory exists
-            if not os.path.exists(txt_files_dir):
-                os.makedirs(txt_files_dir, exist_ok=True)
-                print(f"Created txt_files directory at: {txt_files_dir}")
-            
             # Check for employee codes file
-            employee_codes_path = os.path.join(txt_files_dir, 'EmployeeCodes.txt')
+            employee_codes_path = data_files.path(data_files.EMPLOYEE_CODES)
             
             # Check if file exists
             if not os.path.exists(employee_codes_path):
@@ -3014,7 +2995,7 @@ class EOLTesterGUI:
                 # Handle barcode print file
                 self.barcodePrintFileName = model_result['MM_BARCODE_LABEL_CODE'] or ""
                 if self.barcodePrintFileName and self.barcodePrintFileName != "NO_BARCODE_PRINT_FILE":
-                    self.barcodePrintFileNamePath = os.path.join(os.getcwd(), self.barcodePrintFileName)
+                    self.barcodePrintFileNamePath = data_files.path(self.barcodePrintFileName)
                     if os.path.exists(self.barcodePrintFileNamePath):
                         with open(self.barcodePrintFileNamePath, 'r') as f:
                             self.prnFileContent = f.read()
@@ -3066,7 +3047,7 @@ class EOLTesterGUI:
                         print(f"❌ Failed to write Machine On - PLC will not start")
                 else:
                     print(f"❌ ERROR: MachineOnPLCCoilAddress not configured!")
-                    print(f"   Check txt_files/MachineOnPLCCoilAddress.txt exists")
+                    print(f"   Check MachineOnPLCCoilAddress.txt exists in the project folder")
                     messagebox.showwarning("Configuration Error", 
                         "Machine On PLC Coil Address is not configured!\n" +
                         "Test cannot start without this address.")
@@ -3691,7 +3672,7 @@ class EOLTesterGUI:
 
     def load_input_sensor_addresses(self):
         """PLC input addresses from InputSensors.txt; label Ln reads the nth one."""
-        path = os.path.join(os.path.dirname(__file__), 'txt_files', 'InputSensors.txt')
+        path = data_files.path(data_files.INPUT_SENSORS)
         try:
             with open(path, 'r') as f:
                 return [a.strip() for a in f.read().split(',') if a.strip()]
