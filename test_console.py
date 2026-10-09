@@ -3250,18 +3250,30 @@ class EOLTesterGUI:
             self.last_plc_error = str(e)
             return False
 
+    # How long Machine On is held off before it is switched on
+    MACHINE_ON_OFF_TIME = 0.5
+
     def write_machine_on_to_plc(self):
         """
-        Write Machine On signal to PLC
+        Switch Machine On off, then on, so the PLC always sees it come on.
+
+        Machine On left on by a test that never finished would otherwise
+        stay on, and writing on again would not start the next test.
         Returns: bool - Success status
         """
         try:
             if not self.machineOnPLCCoilAddress or not self.plc_client:
                 return False
-                
+
             # M address to its Modbus coil number (see plc_address.py)
             if self.machineOnPLCCoilAddress.startswith('M'):
                 coil_address = bit_address(self.machineOnPLCCoilAddress)
+                result = self.plc_client.write_coil(coil_address, False, device_id=self.plc_station_id)
+                if result.isError():
+                    print(f"Error switching machine on signal off: {result}")
+                    self.last_plc_error = f"coil {coil_address}: {result}"
+                    return False
+                time.sleep(self.MACHINE_ON_OFF_TIME)
                 result = self.plc_client.write_coil(coil_address, True, device_id=self.plc_station_id)
                 if result.isError():
                     print(f"Error writing machine on signal to PLC: {result}")
