@@ -3702,7 +3702,9 @@ class EOLTesterGUI:
         how far the PLC got through a test.
 
         The Program Select and Machine On coils the console writes are
-        read and shown too, so the log says whether they were already on.
+        read and shown too, so the log says whether they were already on,
+        and so is every program in ProgramSelectionInPLC.txt that is on:
+        one left on by another part would mean two programs are selected.
         """
         coils = [(name, address, status_values.get(address, False))
                  for name, address in zip(self.PROCESS_COIL_NAMES, self.process_addresses)]
@@ -3710,14 +3712,52 @@ class EOLTesterGUI:
                               ('MACHINE ON', self.machineOnPLCCoilAddress)):
             if address:
                 coils.append((name, address, self.read_coil_state(address)))
+        programs_on = self.read_programs_on()
 
-        if coils == getattr(self, 'last_logged_coils', None):
+        if (coils, programs_on) == getattr(self, 'last_logged_coils', None):
             return
-        self.last_logged_coils = coils
+        self.last_logged_coils = (coils, programs_on)
         shown = ", ".join(
             f"{name} {address}={'?' if on is None else 'ON' if on else 'off'}"
             for name, address, on in coils)
-        print(f"PLC coils: {shown}")
+        programs = ('?' if programs_on is None
+                    else ' '.join(programs_on) if programs_on else 'none')
+        print(f"PLC coils: {shown}, PROGRAMS ON: {programs}")
+
+    def program_select_addresses(self):
+        """Every program-select address in ProgramSelectionInPLC.txt."""
+        if getattr(self, '_program_select_addresses', None) is None:
+            try:
+                with open(data_files.path(data_files.PROGRAM_SELECTION_IN_PLC)) as f:
+                    self._program_select_addresses = [
+                        a.strip() for a in f.read().split(',') if a.strip()]
+            except OSError:
+                self._program_select_addresses = []
+        return self._program_select_addresses
+
+    def read_programs_on(self):
+        """The program-select addresses that are on, read in one request,
+        or None if they can't be read."""
+        try:
+            bits = {address: bit_address(address)
+                    for address in self.program_select_addresses()}
+        except ValueError:
+            return None
+        if not bits:
+            return []
+        first = min(bits.values())
+        count = max(bits.values()) - first + 1
+        if count > 2000:            # more than one Modbus request can carry
+            return None
+        try:
+            result = self.plc_client.read_coils(first, count=count,
+                                                device_id=self.plc_station_id)
+            if result.isError():
+                return None
+            return [address for address, bit in bits.items()
+                    if result.bits[bit - first]]
+        except Exception:
+            return None
 
     def read_coil_state(self, address):
         """Whether the M coil at address is on, or None if it can't be read."""
