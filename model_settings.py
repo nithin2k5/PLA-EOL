@@ -68,6 +68,9 @@ class WorkspaceApp:
         # Initialize label tracking dictionaries
         self.label_status = {str(i+1): {'status': 'OFF'} for i in range(16)}
         self.label_details = {str(i+1): {'details': ''} for i in range(16)}
+
+        # Names shown for labels L1-L16, from partlabels.txt
+        self.label_names, label_problem = data_files.part_label_names()
         
         # Track edit mode for CRUD operations
         self.edit_mode = False
@@ -80,6 +83,11 @@ class WorkspaceApp:
         self.init_database()
         
         self.setup_ui()
+
+        if label_problem:
+            messagebox.showwarning(
+                "Part Labels",
+                f"{label_problem}.\n\nThe labels show L1-L16 until the file is corrected.")
 
         # The form opens closed: nothing is being added or edited yet, so
         # the fields are read-only until NEW is pressed or a part is picked.
@@ -335,10 +343,12 @@ class WorkspaceApp:
             self.tree.heading(col, text=heading)
             self.tree.column(col, width=100, anchor='center')
 
-        # Create initial entries for all labels (1-16)
+        # Create initial entries for all labels (1-16). Each row is filed
+        # under its key, L1-L16, and shows the label's name.
         for i in range(1, 17):
             label_text = f'L{i}'
-            self.tree.insert('', 'end', values=(label_text, '', ''))
+            self.tree.insert('', 'end', iid=label_text,
+                             values=(self.label_names[label_text], '', ''))
         
         # Enable editing on double click
         self.tree.bind('<Double-1>', self.on_double_click)
@@ -553,8 +563,9 @@ class WorkspaceApp:
         # Create 16 moveable labels
         self.moveable_labels = []
         for i in range(16):
-            label = tk.Label(self.labels_frame, 
-                           text=f"L{i+1}", 
+            key = f"L{i+1}"
+            label = tk.Label(self.labels_frame,
+                           text=self.label_names[key],  
                            width=4, 
                            relief="raised",
                            bg="lightgray")
@@ -562,7 +573,9 @@ class WorkspaceApp:
             label.bind("<Button-1>", self.start_move)
             label.bind("<B1-Motion>", self.on_motion)  # Bind motion event
             label.bind("<ButtonRelease-1>", self.stop_move)  # Bind release event
-            self.original_positions[f"L{i+1}"] = label
+            # The text is only the label's name; this is what it is filed under
+            label.key = key
+            self.original_positions[key] = label
             self.moveable_labels.append(label)
 
     def create_buttons(self):
@@ -663,15 +676,15 @@ class WorkspaceApp:
         widget = event.widget
         
         if widget.winfo_parent() == str(self.labels_frame):
-            label_text = widget.cget("text")
+            label_text = widget.key
             
             # Check if this label is already placed
             if label_text in self.placed_labels:
                 return
             
             # Create new label in the image quadrant - MATCH test_console.py style
-            new_label = tk.Label(self.image_frame, 
-                               text=label_text,
+            new_label = tk.Label(self.image_frame,
+                               text=self.label_names[label_text],
                                bg="yellow",  # Match test_console.py
                                fg="black",
                                font=("Arial", 12, "bold"),  # Match test_console.py
@@ -757,8 +770,8 @@ class WorkspaceApp:
         item = self.tree.selection()[0]
         column = self.tree.identify_column(event.x)
         
-        # Get label text from the selected item
-        label_text = self.tree.item(item)['values'][0]
+        # Rows are filed under the label's key
+        label_text = item
         
         # ON text (column #2) and OFF text (column #3) are free text. The OFF
         # text is also the caption shown here, as it is what the Test console
@@ -774,7 +787,7 @@ class WorkspaceApp:
 
             def commit(event=None):
                 # Blank means the label's own name, so a label never shows empty
-                new_text = entry.get().strip() or label_text
+                new_text = entry.get().strip() or self.label_names[label_text]
                 values = list(self.tree.item(item)['values'])
                 values[col_idx] = new_text
                 self.tree.item(item, values=tuple(values))
@@ -903,8 +916,7 @@ class WorkspaceApp:
         
         # Reset all label statuses in treeview
         for item in self.tree.get_children():
-            label_text = self.tree.item(item)['values'][0]
-            self.tree.item(item, values=(label_text, '', ''))
+            self.tree.item(item, values=(self.label_names[item], '', ''))
         
         # Reset stored positions
         self.original_positions = {key: label for key, label in self.original_positions.items() 
@@ -1095,35 +1107,24 @@ class WorkspaceApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def update_treeview(self):
-        existing_labels = set()
-        
-        # Get existing labels from treeview
-        for item in self.tree.get_children():
-            label_text = self.tree.item(item)['values'][0]
-            existing_labels.add(label_text)
-        
         # Update or add entries. Placed labels keep the ON/OFF text already
         # entered for them; unplaced ones have none.
         for i in range(1, 17):
             label_text = f'L{i}'
+            name = self.label_names[label_text]
             if label_text in self.placed_labels:
                 on_status, off_status = self.label_texts(label_text)
-                on_status = on_status or label_text
-                off_status = off_status or label_text
+                on_status = on_status or name
+                off_status = off_status or name
             else:
                 on_status = ''
                 off_status = ''
 
-            # If label exists, update it. If not, create new entry
-            if label_text in existing_labels:
-                # Find and update existing item
-                for item in self.tree.get_children():
-                    if self.tree.item(item)['values'][0] == label_text:
-                        self.tree.item(item, values=(label_text, on_status, off_status))
-                        break
+            values = (name, on_status, off_status)
+            if self.tree.exists(label_text):
+                self.tree.item(label_text, values=values)
             else:
-                # Create new entry only if it doesn't exist
-                self.tree.insert('', 'end', values=(label_text, on_status, off_status))
+                self.tree.insert('', 'end', iid=label_text, values=values)
 
     def create_edit_popup(self, item, label_num):
         popup = tk.Toplevel(self)
@@ -1185,13 +1186,12 @@ class WorkspaceApp:
 
     def update_label_status(self, label_text):
         """Give a newly placed label its ON/OFF text, keeping any already set."""
+        name = self.label_names[label_text]
         on_text, off_text = self.label_texts(label_text)
-        on_text = on_text or label_text
-        off_text = off_text or label_text
-        for item in self.tree.get_children():
-            if self.tree.item(item)['values'][0] == label_text:
-                self.tree.item(item, values=(label_text, on_text, off_text))
-                break
+        on_text = on_text or name
+        off_text = off_text or name
+        if self.tree.exists(label_text):
+            self.tree.item(label_text, values=(name, on_text, off_text))
 
         # The caption on the image is the OFF text
         if label_text in self.placed_labels:
@@ -1199,13 +1199,12 @@ class WorkspaceApp:
 
     def label_texts(self, label_text):
         """The ON and OFF text in the Label Details grid for a label."""
-        for item in self.tree.get_children():
-            values = self.tree.item(item)['values']
-            if values and values[0] == label_text:
-                # Treeview hands numeric-looking cells back as ints
-                on_text = str(values[1]) if len(values) > 1 else ''
-                off_text = str(values[2]) if len(values) > 2 else ''
-                return on_text, off_text
+        if self.tree.exists(label_text):
+            values = self.tree.item(label_text)['values']
+            # Treeview hands numeric-looking cells back as ints
+            on_text = str(values[1]) if len(values) > 1 else ''
+            off_text = str(values[2]) if len(values) > 2 else ''
+            return on_text, off_text
         return '', ''
 
     def label_coordinate(self, label_text, label_widget):
@@ -1215,8 +1214,8 @@ class WorkspaceApp:
             'x': float(label_widget.winfo_x()),
             'y': float(label_widget.winfo_y()),
             'text': str(label_widget.cget('text')),
-            'on_text': on_text or label_text,
-            'off_text': off_text or label_text,
+            'on_text': on_text or self.label_names[label_text],
+            'off_text': off_text or self.label_names[label_text],
         }
 
     def init_database(self):
@@ -1870,7 +1869,8 @@ class WorkspaceApp:
                 for label_num, coord_data in coordinates.items():
                     try:
                         label_text = f'L{label_num}'
-                        display_text = coord_data.get('text', label_text)
+                        display_text = data_files.shown_label_text(
+                            self.label_names, label_text, coord_data.get('text'))
                         
                         new_label = tk.Label(
                             self.image_frame,
@@ -1904,17 +1904,21 @@ class WorkspaceApp:
                 
                 # Update the treeview to reflect label positions, then put back
                 # each label's ON/OFF text. Parts saved before labels had them
-                # use their caption for both.
+                # use their caption for both, and text saved as the bare key
+                # shows the label's name.
                 self.update_treeview()
                 for label_num, coord_data in coordinates.items():
                     label_text = f'L{label_num}'
-                    caption = coord_data.get('text') or label_text
-                    on_text = coord_data.get('on_text') or caption
-                    off_text = coord_data.get('off_text') or caption
-                    for item in self.tree.get_children():
-                        if self.tree.item(item)['values'][0] == label_text:
-                            self.tree.item(item, values=(label_text, on_text, off_text))
-                            break
+                    if not self.tree.exists(label_text):
+                        continue
+                    caption = data_files.shown_label_text(
+                        self.label_names, label_text, coord_data.get('text'))
+                    on_text = data_files.shown_label_text(
+                        self.label_names, label_text, coord_data.get('on_text') or caption)
+                    off_text = data_files.shown_label_text(
+                        self.label_names, label_text, coord_data.get('off_text') or caption)
+                    self.tree.item(label_text, values=(
+                        self.label_names[label_text], on_text, off_text))
                 print(f"Successfully placed {labels_placed} labels")
             else:
                 print(f"No label coordinates found for part: {part_number}")

@@ -32,6 +32,48 @@ FORMER_NAMES = {
 }
 
 
+PART_LABEL_COUNT = 16
+PART_LABEL_LENGTH = 3
+
+
+def part_label_names():
+    """Names shown for sensor labels L1-L16, and what is wrong with the file.
+
+    partlabels.txt holds 16 comma separated names, three characters each,
+    no two alike. If it is missing or breaks a rule the labels keep their
+    own names, and the reason comes back so the screen can say so. Only
+    what is shown changes: positions, results and PLC addresses are still
+    keyed L1-L16.
+    """
+    keys = [f"L{n}" for n in range(1, PART_LABEL_COUNT + 1)]
+    file_path = path(PART_LABELS)
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read().strip()
+    except OSError:
+        return dict(zip(keys, keys)), f"{PART_LABELS} not found at {file_path}"
+
+    names = [name.strip() for name in content.split(',')]
+    if len(names) != PART_LABEL_COUNT:
+        problem = (f"{PART_LABELS} must hold exactly {PART_LABEL_COUNT} comma "
+                   f"separated label names, with nothing after the last one")
+    elif any(len(name) != PART_LABEL_LENGTH for name in names):
+        problem = f"Every label name in {PART_LABELS} must be {PART_LABEL_LENGTH} characters long"
+    elif len(set(names)) != len(names):
+        problem = f"{PART_LABELS} must not repeat a label name"
+    else:
+        return dict(zip(keys, names)), None
+    return dict(zip(keys, keys)), problem
+
+
+def shown_label_text(names, key, text):
+    """Text a label shows: what was saved for it, or its name from
+    partlabels.txt when nothing was or the label's own key was saved."""
+    if not text or text == key:
+        return names.get(key, key)
+    return text
+
+
 def path(name):
     """Full path of a data file.
 

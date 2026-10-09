@@ -838,12 +838,16 @@ class EOLTesterGUI:
 
         # The labels a part can use. One moves up onto the image while its
         # part is loaded, as it does in Model Settings.
+        # They show their names from partlabels.txt.
+        self.label_names, label_problem = data_files.part_label_names()
+        if label_problem:
+            print(f"Warning: {label_problem}; the labels show L1-L{self.LABEL_COUNT}")
         row = tk.Frame(picture, bg='white')
         row.pack(fill="x", padx=8, pady=(2, 4))
         self.label_row = {}
         for number in range(1, self.LABEL_COUNT + 1):
             key = f"L{number}"
-            tag = tk.Label(row, text=key, bg='white', fg='black',
+            tag = tk.Label(row, text=self.label_names[key], bg='white', fg='black',
                            font=(self.FONT, 11, 'bold'))
             tag.pack(side="left", padx=(0, 12))
             self.label_row[key] = tag
@@ -2713,11 +2717,15 @@ class EOLTesterGUI:
                         # Create label with enhanced visibility. label_text is
                         # the canonical key. Model Settings sets the text shown
                         # while the sensor is off and while it is on; parts saved
-                        # before that use their caption for both.
+                        # before that use their caption for both. Text saved
+                        # as the bare key shows the label's name.
                         label_text = f'L{label_num}'
-                        caption = coord_data.get('text') or label_text
-                        off_text = coord_data.get('off_text') or caption
-                        on_text = coord_data.get('on_text') or caption
+                        caption = data_files.shown_label_text(
+                            self.label_names, label_text, coord_data.get('text'))
+                        off_text = data_files.shown_label_text(
+                            self.label_names, label_text, coord_data.get('off_text') or caption)
+                        on_text = data_files.shown_label_text(
+                            self.label_names, label_text, coord_data.get('on_text') or caption)
                         new_label = tk.Label(self.image_frame,
                                            text=off_text,
                                            bg="yellow",  # Initial background color
