@@ -3651,6 +3651,8 @@ class EOLTesterGUI:
                     time.sleep(1)
                     continue
 
+                self.log_process_coil_changes(status_values)
+
                 # Put result in queue (non-blocking)
                 try:
                     self.plc_status_queue.put_nowait(status_values)
@@ -3677,6 +3679,25 @@ class EOLTesterGUI:
 
         # Let start_plc_status_monitoring() start a fresh worker next time.
         self.plc_thread_running = False
+
+    # What each ProcessStatus.txt address is, in file order
+    PROCESS_COIL_NAMES = ('AUTO', 'HOME', 'PULL1 OK', 'PULL1 NG', 'PULL2 OK',
+                          'PULL2 NG', 'RESULT OK', 'RESULT NG',
+                          'CAM1 OK', 'CAM1 NG', 'CAM1 ON')
+
+    def log_process_coil_changes(self, status_values):
+        """Print the process coils whenever one changes, so the log shows
+        how far the PLC got through a test."""
+        states = tuple(status_values.get(address, False)
+                       for address in self.process_addresses)
+        if states == getattr(self, 'last_logged_coils', None):
+            return
+        self.last_logged_coils = states
+        shown = ", ".join(
+            f"{name} {address}={'ON' if on else 'off'}"
+            for name, address, on in zip(self.PROCESS_COIL_NAMES,
+                                         self.process_addresses, states))
+        print(f"PLC coils: {shown}")
 
     def load_input_sensor_addresses(self):
         """PLC input addresses from InputSensors.txt; label Ln reads the nth one."""
