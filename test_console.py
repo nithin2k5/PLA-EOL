@@ -3687,17 +3687,36 @@ class EOLTesterGUI:
 
     def log_process_coil_changes(self, status_values):
         """Print the process coils whenever one changes, so the log shows
-        how far the PLC got through a test."""
-        states = tuple(status_values.get(address, False)
-                       for address in self.process_addresses)
-        if states == getattr(self, 'last_logged_coils', None):
+        how far the PLC got through a test.
+
+        The Program Select and Machine On coils the console writes are
+        read and shown too, so the log says whether they were already on.
+        """
+        coils = [(name, address, status_values.get(address, False))
+                 for name, address in zip(self.PROCESS_COIL_NAMES, self.process_addresses)]
+        for name, address in (('PROGRAM SELECT', self.programSelectionPLCAddress),
+                              ('MACHINE ON', self.machineOnPLCCoilAddress)):
+            if address:
+                coils.append((name, address, self.read_coil_state(address)))
+
+        if coils == getattr(self, 'last_logged_coils', None):
             return
-        self.last_logged_coils = states
+        self.last_logged_coils = coils
         shown = ", ".join(
-            f"{name} {address}={'ON' if on else 'off'}"
-            for name, address, on in zip(self.PROCESS_COIL_NAMES,
-                                         self.process_addresses, states))
+            f"{name} {address}={'?' if on is None else 'ON' if on else 'off'}"
+            for name, address, on in coils)
         print(f"PLC coils: {shown}")
+
+    def read_coil_state(self, address):
+        """Whether the M coil at address is on, or None if it can't be read."""
+        try:
+            result = self.plc_client.read_coils(bit_address(address), count=1,
+                                                device_id=self.plc_station_id)
+            if result.isError():
+                return None
+            return bool(result.bits[0])
+        except Exception:
+            return None
 
     def load_input_sensor_addresses(self):
         """PLC input addresses from InputSensors.txt; label Ln reads the nth one."""
