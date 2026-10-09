@@ -756,6 +756,7 @@ class EOLTesterGUI:
         if not self.cameras_ready_for_test():
             return
 
+        self.trace(f"START pressed for part {self.current_part_number}")
         # Each failed write says which coil it tried and what the PLC answered
         not_m_coil = "address missing or not an M coil (e.g. M1000)"
         failed = []
@@ -1957,6 +1958,10 @@ class EOLTesterGUI:
                 return
 
             self.score_spec_rows()
+            kind = ("starting NG cable check" if self.startingNGCableValidation
+                    else "closing NG cable check" if self.endingNGCableValidation
+                    else "production part")
+            self.trace(f"SCORED as {kind}: {self.passCounter} pass, {self.failCounter} fail")
 
             if self.startingNGCableValidation:
                 # The operator ran the known-bad cable, so a failure is the
@@ -2018,6 +2023,7 @@ class EOLTesterGUI:
     def prepare_next_cycle(self):
         """Clear the finished test and hand the machine the next part."""
         try:
+            self.trace("NEXT CYCLE - readings cleared, Machine On for the next part")
             self.reset_test_parameters()
             self.reset_dgv_spec_data()
             self.write_machine_on_to_plc()
@@ -2052,6 +2058,7 @@ class EOLTesterGUI:
 
         try:
             self.log_operator_action("NEXT_MODEL", "Closing NG cable check started")
+            self.trace("NEXT MODEL pressed - run the NG cable to release the part")
             self.breakLoop = True
 
             # One closing validation at a time - execute_cycle_restart()
@@ -3085,6 +3092,9 @@ class EOLTesterGUI:
                 # ===================================================================
                 
                 print("\n✅ Part loaded successfully!")
+                self.trace(f"PART {self.partNumber} loaded from ALC {alc_code} - "
+                           f"program {self.programSelectionPLCAddress}, "
+                           f"{len(self.deviceToRead)} spec row(s): {' '.join(self.deviceToRead)}")
                 print("🚀 Starting test automatically - no button click required")
                 
                 # Set current part number for testing
@@ -3223,32 +3233,42 @@ class EOLTesterGUI:
         except Exception as e:
             print(f"Error loading model label details: {e}")
 
+    def trace(self, message):
+        """One timestamped line in the terminal on what the test is doing."""
+        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} [TEST] {message}")
+
+    def write_named_coil(self, name, address, value):
+        """Write one M coil, tracing what was written and how the PLC answered."""
+        state = 'ON' if value else 'off'
+        try:
+            # M address to its Modbus coil number (see plc_address.py)
+            coil = bit_address(address)
+            result = self.plc_client.write_coil(coil, value, device_id=self.plc_station_id)
+        except Exception as e:
+            self.trace(f"WRITE {name} {address} = {state} -> FAILED: {e}")
+            self.last_plc_error = str(e)
+            return False
+        if result.isError():
+            self.trace(f"WRITE {name} {address} (coil {coil}) = {state} -> PLC REFUSED: {result}")
+            self.last_plc_error = f"coil {coil}: {result}"
+            return False
+        self.trace(f"WRITE {name} {address} (coil {coil}) = {state} -> accepted")
+        return True
+
     def write_program_selection_to_plc(self, value=True):
         """
         Write program selection to PLC. False releases the program once the
         closing NG cable check has passed.
         Returns: bool - Success status
         """
-        try:
-            if not self.programSelectionPLCAddress or not self.plc_client:
-                return False
-                
-            # M address to its Modbus coil number (see plc_address.py)
-            if self.programSelectionPLCAddress.startswith('M'):
-                coil_address = bit_address(self.programSelectionPLCAddress)
-                result = self.plc_client.write_coil(coil_address, value, device_id=self.plc_station_id)
-                if result.isError():
-                    print(f"Error writing program selection to PLC: {result}")
-                    self.last_plc_error = f"coil {coil_address}: {result}"
-                    return False
-                else:
-                    print(f"✅ Program selection written: {self.programSelectionPLCAddress} = {value}")
-                    return True
+        if not self.plc_client:
+            self.trace("WRITE PROGRAM SELECT skipped - the PLC is not connected")
             return False
-        except Exception as e:
-            print(f"Error writing program selection to PLC: {e}")
-            self.last_plc_error = str(e)
+        if not self.programSelectionPLCAddress or not self.programSelectionPLCAddress.startswith('M'):
+            self.trace(f"WRITE PROGRAM SELECT skipped - the part's PLC address "
+                       f"'{self.programSelectionPLCAddress}' is not an M coil")
             return False
+        return self.write_named_coil('PROGRAM SELECT', self.programSelectionPLCAddress, value)
 
     # How long Machine On is held off before it is switched on
     MACHINE_ON_OFF_TIME = 0.5
@@ -3261,34 +3281,17 @@ class EOLTesterGUI:
         stay on, and writing on again would not start the next test.
         Returns: bool - Success status
         """
-        try:
-            if not self.machineOnPLCCoilAddress or not self.plc_client:
-                return False
-
-            # M address to its Modbus coil number (see plc_address.py)
-            if self.machineOnPLCCoilAddress.startswith('M'):
-                coil_address = bit_address(self.machineOnPLCCoilAddress)
-                result = self.plc_client.write_coil(coil_address, False, device_id=self.plc_station_id)
-                if result.isError():
-                    print(f"Error switching machine on signal off: {result}")
-                    self.last_plc_error = f"coil {coil_address}: {result}"
-                    return False
-                time.sleep(self.MACHINE_ON_OFF_TIME)
-                result = self.plc_client.write_coil(coil_address, True, device_id=self.plc_station_id)
-                if result.isError():
-                    print(f"Error writing machine on signal to PLC: {result}")
-                    self.last_plc_error = f"coil {coil_address}: {result}"
-                    return False
-                else:
-                    print(f"✅ Machine On written: {self.machineOnPLCCoilAddress}")
-                    return True
-            else:
-                print("⚠️ Machine On PLC Coil Address not configured")
-                return False
-        except Exception as e:
-            print(f"Error writing machine on signal to PLC: {e}")
-            self.last_plc_error = str(e)
+        if not self.plc_client:
+            self.trace("WRITE MACHINE ON skipped - the PLC is not connected")
             return False
+        if not self.machineOnPLCCoilAddress or not self.machineOnPLCCoilAddress.startswith('M'):
+            self.trace(f"WRITE MACHINE ON skipped - MachineOnPLCCoilAddress.txt holds "
+                       f"'{self.machineOnPLCCoilAddress}', not an M coil")
+            return False
+        if not self.write_named_coil('MACHINE ON', self.machineOnPLCCoilAddress, False):
+            return False
+        time.sleep(self.MACHINE_ON_OFF_TIME)
+        return self.write_named_coil('MACHINE ON', self.machineOnPLCCoilAddress, True)
 
     def display_data(self):
         """Show today's passing results for the current part and refresh the counters."""
@@ -3599,6 +3602,7 @@ class EOLTesterGUI:
             # Verify PLC connection
             if not hasattr(self, 'plc_client') or not self.plc_client or not self.plc_client.is_socket_open():
                 print("⚠️ PLC not connected - cannot start monitoring")
+                self.trace("NOT STARTED - the PLC is not connected")
                 self.safe_update_message("PLC not connected - cannot start test", "red")
                 return
             
@@ -3664,6 +3668,7 @@ class EOLTesterGUI:
                     continue
 
                 self.log_process_coil_changes(status_values)
+                self.trace_waiting(status_values)
 
                 # Put result in queue (non-blocking)
                 try:
@@ -3714,8 +3719,20 @@ class EOLTesterGUI:
                 coils.append((name, address, self.read_coil_state(address)))
         programs_on = self.read_programs_on()
 
-        if (coils, programs_on) == getattr(self, 'last_logged_coils', None):
+        last = getattr(self, 'last_logged_coils', None)
+        if (coils, programs_on) == last:
             return
+        if last:
+            # Name each coil that changed, as it happens
+            before = {(name, address): on for name, address, on in last[0]}
+            for name, address, on in coils:
+                was = before.get((name, address))
+                if was is not None and was != on:
+                    self.trace(f"PLC {name} {address}: {'ON' if was else 'off'} -> "
+                               f"{'?' if on is None else 'ON' if on else 'off'}")
+            if programs_on != last[1]:
+                self.trace(f"PLC programs on: {' '.join(last[1] or []) or 'none'} -> "
+                           f"{' '.join(programs_on or []) or 'none'}")
         self.last_logged_coils = (coils, programs_on)
         shown = ", ".join(
             f"{name} {address}={'?' if on is None else 'ON' if on else 'off'}"
@@ -3723,6 +3740,40 @@ class EOLTesterGUI:
         programs = ('?' if programs_on is None
                     else ' '.join(programs_on) if programs_on else 'none')
         print(f"PLC coils: {shown}, PROGRAMS ON: {programs}")
+
+    def plc_stage(self, status_values):
+        """Where the PLC is in a test, judged from the process coils."""
+        on = {name: status_values.get(address, False)
+              for name, address in zip(self.PROCESS_COIL_NAMES, self.process_addresses)}
+        if on.get('RESULT OK') or on.get('RESULT NG'):
+            return "the result is in"
+        if on.get('PULL2 OK') or on.get('PULL2 NG'):
+            return "2nd pull done, waiting for the result"
+        if on.get('PULL1 OK') or on.get('PULL1 NG'):
+            return "1st pull done, waiting for the 2nd pull"
+        if not on.get('AUTO'):
+            return "the PLC is not in AUTO"
+        if on.get('HOME'):
+            return "the PLC is in AUTO at HOME and has not started the 1st pull"
+        return "the PLC is in AUTO away from HOME - a pull may be running"
+
+    def trace_waiting(self, status_values):
+        """Every 5 seconds while a part is loaded and no result is in, say
+        what the test is waiting for."""
+        if not getattr(self, 'current_part_number', None) or self.rcvdTestRslt:
+            self._last_wait_trace = 0
+            return
+        now = time.time()
+        if now - getattr(self, '_last_wait_trace', 0) < 5:
+            return
+        if not getattr(self, '_last_wait_trace', 0):
+            self._wait_started = now
+        self._last_wait_trace = now
+        last = getattr(self, 'last_logged_coils', None)
+        programs = ' '.join(last[1]) if last and last[1] else 'none'
+        self.trace(f"WAITING {now - self._wait_started:.0f}s: {self.plc_stage(status_values)} "
+                   f"| programs on: {programs} | L1 {self.L1MaxValue} P1 {self.P01Value} "
+                   f"P2 {self.P02Value}")
 
     def program_select_addresses(self):
         """Every program-select address in ProgramSelectionInPLC.txt."""
@@ -4011,6 +4062,9 @@ class EOLTesterGUI:
                             self.rcvdTestRslt = True
                             self.awaiting_result_clear = True
                             print("✅ Test result received from PLC")
+                            self.trace(f"PLC RESULT {'OK' if test_ok_result else 'NG'} - "
+                                       f"L1 {self.L1MaxValue} P1 {self.P01Value} "
+                                       f"P2 {self.P02Value}")
                             # Handle test completion
                             self.root.after(500, self.test_result_command)
                     else:
@@ -4277,6 +4331,7 @@ class EOLTesterGUI:
             connection.commit()
 
             print(f"Test data saved: {status} - Lot: {self.lotNo}, Traceability: {self.traceabilityCode}")
+            self.trace(f"SAVED {status} - lot {self.lotNo}, {self.traceabilityCode}")
             self.log_operator_action("TEST_SAVED", f"{status} - lot {self.lotNo}, {self.traceabilityCode}")
             
             # Update or insert part running serial
