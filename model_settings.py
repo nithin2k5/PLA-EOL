@@ -1264,7 +1264,10 @@ class WorkspaceApp:
             # Insert records into treeview
             for row in cursor.fetchall():
                 formatted_date = row[2].strftime('%Y-%m-%d %H:%M:%S') if row[2] else ''
-                self.part_list_tree.insert('', 'end', values=(row[0], row[1], formatted_date))
+                # Filed under the part number as text: the cells hand back
+                # a number-like part number as an int, dropping leading zeros
+                self.part_list_tree.insert('', 'end', iid=str(row[0]),
+                                           values=(row[0], row[1], formatted_date))
             
             cursor.close()
             conn.close()
@@ -1416,8 +1419,8 @@ class WorkspaceApp:
                     messagebox.showerror(
                         "Update Error",
                         f"Part Number cannot be changed during edit!\n\n" +
-                        "Original Part Number: {self.current_selected_part}\n" +
-                        "Current Part Number: {part_number}\n\n" +
+                        f"Original Part Number: {self.current_selected_part}\n" +
+                        f"Current Part Number: {part_number}\n\n" +
                         "The Part Number is locked during editing to maintain data integrity."
                     )
                     return
@@ -2022,7 +2025,7 @@ class WorkspaceApp:
         
         # Get the selected item
         item = selected_items[0]
-        part_number = self.part_list_tree.item(item)['values'][0]
+        part_number = item  # rows are filed under their part number
         
         # Store the currently selected part number (but don't enter edit mode)
         self.current_selected_part = part_number
