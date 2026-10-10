@@ -201,6 +201,24 @@ SCHEMA = [
         )
     """),
 
+    # Each part's OK cables, counted into lots. A lot is OPEN while it fills,
+    # FULL once it reaches its size, PARTIAL if the part was released first.
+    ("TBL_PART_LOT", """
+        CREATE TABLE IF NOT EXISTS TBL_PART_LOT (
+            ID INT AUTO_INCREMENT PRIMARY KEY,
+            LT_PART_NUMBER VARCHAR(100) NOT NULL,
+            LT_LOT_NUMBER INT NOT NULL,
+            LT_LOT_SIZE INT,
+            LT_OK_COUNT INT NOT NULL DEFAULT 0,
+            LT_START_TRACE_CODE VARCHAR(100),
+            LT_LAST_TRACE_CODE VARCHAR(100),
+            LT_STATUS VARCHAR(10) NOT NULL DEFAULT 'OPEN',
+            LT_START_DATETIME DATETIME,
+            LT_END_DATETIME DATETIME,
+            UNIQUE KEY unique_part_lot (LT_PART_NUMBER, LT_LOT_NUMBER)
+        )
+    """),
+
     # Who did what on the Test console: logins, part loads, saved tests,
     # NG cable checks and label scans.
     ("TBL_OPERATOR_LOG", """

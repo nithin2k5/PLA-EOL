@@ -456,7 +456,15 @@ class EOLTesterGUI:
         self.dataPointX = 0
         self.chart_series = {name: [] for name in
                              ('L1', 'L2', 'L3', 'L4', 'P1', 'P2', 'P3', 'P4')}
-        
+
+        # The current lot panel: the part it shows (None once released), the
+        # part's OPEN row in TBL_PART_LOT, and the size the operator set
+        self.lot_part = None
+        self.open_lot = None
+        self.lot_size = None
+        self.lot_total_ok = 0
+        self.lot_number = 0
+
         # Machine and Process Variables
         self.machineID = self.machineid  # Use existing machine ID
         self.startingNGCableValidation = False
@@ -578,7 +586,7 @@ class EOLTesterGUI:
     AQUA = ui.AQUA
     YELLOW = ui.YELLOW
     SILVER = ui.SILVER
-    POWDER = ui.POWDER          # counter strip
+    GREEN = ui.LOT_GREEN        # lot progress and scan counters
     EDGE = ui.BORDER            # thin panel borders
     PLACEHOLDER_INK = '#A9A9A9'
     EMP_PLACEHOLDER = 'EMPLOYEE CODE'
@@ -967,7 +975,13 @@ class EOLTesterGUI:
         self.current_columns = self.lot_columns(())
         self.create_lot_tree(self.grid_frame, self.current_columns)
 
-        self.create_scan_counters(panel)
+        # The current lot and the scan counters, side by side under the grid
+        strip = tk.Frame(panel, bg=self.PANEL)
+        strip.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        strip.grid_columnconfigure(0, weight=1)
+        strip.grid_columnconfigure(1, weight=0)
+        self.create_lot_progress(strip).grid(row=0, column=0, sticky="nsew")
+        self.create_scan_counters(strip).grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
         inputs = tk.Frame(panel, bg=self.PANEL)
         inputs.grid(row=2, column=0, sticky="ew", pady=(4, 0))
@@ -1015,30 +1029,86 @@ class EOLTesterGUI:
 
         return panel
 
-    def create_scan_counters(self, parent_frame):
-        """Build the OK / NG / invalid / total strip shown under the results grid."""
-        box = tk.LabelFrame(parent_frame, text="SCAN RESULT COUNTERS", bg=self.POWDER,
-                            fg='black', font=(self.FONT, 9, 'bold'), bd=1, relief='groove')
-        box.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+    def create_lot_progress(self, parent_frame):
+        """Build the current lot box: OK cables, lot number, progress and trace codes.
 
-        definitions = (("OK", "OK Count :"), ("NG", "NG Count :"),
-                       ("INVALID", "*** Count :"), ("TOTAL", "Total Count :"))
+        Until the operator sets a lot size, Progress shows only the size box;
+        the count and bar join it once there is a size to count towards.
+        """
+        font = (self.FONT, 9, 'bold')
+        box = tk.LabelFrame(parent_frame, text="CURRENT LOT PROGRESS", bg=self.GREEN,
+                            fg='black', font=font, bd=1, relief='groove')
+
+        def line():
+            row = tk.Frame(box, bg=self.GREEN)
+            row.pack(fill="x", padx=6, pady=(0, 2))
+            return row
+
+        def caption(row, text):
+            tk.Label(row, text=text, bg=self.GREEN, fg='black', font=font).pack(side="left")
+
+        def value(row, gap=8):
+            label = tk.Label(row, text="", bg=self.GREEN, fg='black', font=font)
+            label.pack(side="left", padx=(2, gap))
+            return label
+
+        first = line()
+        caption(first, "Total OK Cables:")
+        self.lot_total_label = value(first)
+        caption(first, "LOT #:")
+        self.lot_number_label = value(first)
+        caption(first, "Progress:")
+
+        progress = tk.Frame(first, bg=self.GREEN)
+        progress.pack(side="left", padx=(2, 0))
+        self.lot_count_label = tk.Label(progress, text="", bg=self.GREEN, fg='black', font=font)
+        self.lot_count_label.grid(row=0, column=0)
+        self.lot_slash_label = tk.Label(progress, text="/", bg=self.GREEN, fg='black', font=font)
+        self.lot_slash_label.grid(row=0, column=1, padx=2)
+        self.lot_size_entry = tk.Entry(progress, width=5, font=font, justify="center",
+                                       relief="sunken", bd=1, fg='black',
+                                       disabledforeground='black', insertbackground='black')
+        self.lot_size_entry.grid(row=0, column=2)
+        self.lot_size_entry.bind("<Return>", self.apply_lot_size)
+        self.lot_size_entry.bind("<FocusOut>", self.apply_lot_size)
+        self.lot_bar = tk.Frame(progress, bg='white', width=80, height=12,
+                                relief="sunken", bd=1)
+        self.lot_bar.grid(row=0, column=3, padx=(6, 0))
+        self.lot_bar_fill = tk.Frame(self.lot_bar, bg=self.NAVY)
+
+        second = line()
+        caption(second, "Start TraceCode:")
+        self.lot_start_label = value(second)
+        caption(second, "Last OK:")
+        self.lot_last_label = value(second)
+
+        self.show_lot_progress()
+        return box
+
+    def create_scan_counters(self, parent_frame):
+        """Build the OK / NG / invalid / total counters shown beside the lot box."""
+        box = tk.LabelFrame(parent_frame, text="SCAN RESULT COUNTERS", bg=self.GREEN,
+                            fg='black', font=(self.FONT, 9, 'bold'), bd=1, relief='groove')
+
+        definitions = (("OK", "OK Count :"), ("INVALID", "*** Count :"),
+                       ("NG", "NG Count :"), ("TOTAL", "Total Count :"))
         self.scan_count_labels = {}
-        for column, (key, caption) in enumerate(definitions):
-            box.grid_columnconfigure(column, weight=1)
-            cell = tk.Frame(box, bg=self.POWDER)
-            cell.grid(row=0, column=column, sticky="w", padx=8, pady=(0, 4))
-            tk.Label(cell, text=caption, bg=self.POWDER, fg='black',
-                     font=(self.FONT, 9, 'bold')).pack(side="left")
-            value = tk.Label(cell, text="", bg='#E0FFFF', fg='black', width=7,
+        for position, (key, caption) in enumerate(definitions):
+            row, column = divmod(position, 2)
+            box.grid_columnconfigure(column * 2 + 1, weight=1)
+            tk.Label(box, text=caption, bg=self.GREEN, fg='black',
+                     font=(self.FONT, 9, 'bold')).grid(row=row, column=column * 2,
+                                                       sticky="e", padx=(4, 2), pady=(0, 2))
+            value = tk.Label(box, text="", bg='#E0FFFF', fg='black', width=5,
                              relief='sunken', bd=1, font=(self.FONT, 9, 'bold'))
-            value.pack(side="left", padx=(4, 0))
+            value.grid(row=row, column=column * 2 + 1, sticky="w", padx=(0, 4), pady=(0, 2))
             self.scan_count_labels[key] = value
 
         self.ok_count_label = self.scan_count_labels["OK"]
         self.ng_count_label = self.scan_count_labels["NG"]
         self.invalid_count_label = self.scan_count_labels["INVALID"]
         self.total_count_label = self.scan_count_labels["TOTAL"]
+        return box
 
     def create_lot_tree(self, parent_frame, columns):
         """Create the lot tree with specified columns"""
@@ -1777,7 +1847,14 @@ class EOLTesterGUI:
         try:
             print("🔄 EXECUTING CYCLE RESTART")
             released_by = self.current_employee_id
-            
+
+            # The part's unfinished lot ends with it; the lot box waits for
+            # the next part
+            self.close_partial_lot()
+            self.lot_part = None
+            self.open_lot = None
+            self.show_lot_progress()
+
             # Clear current part number to force new selection
             if hasattr(self, 'current_part_number'):
                 delattr(self, 'current_part_number')
@@ -3306,6 +3383,7 @@ class EOLTesterGUI:
 
             self.update_scan_result_counters(rows)
             self.populate_data_grid(rows)
+            self.load_lot_progress()
             print(f"Displaying {len(rows)} test records for part: {self.partNumber}")
 
         except Exception as e:
@@ -3330,6 +3408,233 @@ class EOLTesterGUI:
                 label.config(text="")
         except Exception as e:
             print(f"Error resetting scan result counters: {e}")
+
+    def load_lot_progress(self):
+        """Read the part's open lot and running totals into the lot box.
+
+        A newly loaded part starts from the size of its last lot; after that
+        the size the operator sets stays until the part is released.
+        """
+        if not self.partNumber:
+            return
+
+        try:
+            connection = self.get_database_connection()
+            if not connection:
+                return
+
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT COALESCE(SUM(LT_OK_COUNT), 0) AS TOTAL_OK
+                FROM TBL_PART_LOT
+                WHERE LT_PART_NUMBER = %s
+            """, (self.partNumber,))
+            total_ok = int(cursor.fetchone()['TOTAL_OK'])
+            cursor.execute("""
+                SELECT *
+                FROM TBL_PART_LOT
+                WHERE LT_PART_NUMBER = %s
+                ORDER BY LT_LOT_NUMBER DESC
+                LIMIT 1
+            """, (self.partNumber,))
+            latest = cursor.fetchone()
+            cursor.close()
+            connection.close()
+
+            if self.lot_part != self.partNumber:
+                self.lot_part = self.partNumber
+                self.lot_size = latest['LT_LOT_SIZE'] if latest else None
+
+            self.lot_total_ok = total_ok
+            if latest and latest['LT_STATUS'] == 'OPEN':
+                self.open_lot = latest
+                self.lot_size = latest['LT_LOT_SIZE'] or self.lot_size
+                self.lot_number = latest['LT_LOT_NUMBER']
+            else:
+                # The next OK cable starts the next lot
+                self.open_lot = None
+                self.lot_number = (latest['LT_LOT_NUMBER'] if latest else 0) + 1
+
+            self.show_lot_progress()
+
+        except Exception as e:
+            print(f"Error loading lot progress: {e}")
+
+    def show_lot_progress(self):
+        """Fill the lot box from the lot state; blank it when no part is loaded."""
+        loaded = self.lot_part is not None
+        lot = self.open_lot
+        count = lot['LT_OK_COUNT'] if lot else 0
+
+        self.lot_total_label.configure(text=str(self.lot_total_ok) if loaded else "")
+        self.lot_number_label.configure(text=str(self.lot_number) if loaded else "")
+        self.lot_start_label.configure(text=(lot['LT_START_TRACE_CODE'] or "") if lot else "")
+        self.lot_last_label.configure(text=(lot['LT_LAST_TRACE_CODE'] or "") if lot else "")
+
+        # Yellow asks for a size; leave the text alone while it is being typed
+        fill = self.YELLOW if loaded and not self.lot_size else 'white'
+        entry = self.lot_size_entry
+        if self.root.focus_get() is not entry:
+            entry.configure(state='normal')
+            entry.delete(0, tk.END)
+            if loaded and self.lot_size:
+                entry.insert(0, str(self.lot_size))
+        entry.configure(bg=fill, disabledbackground=fill,
+                        state='normal' if loaded else 'disabled')
+
+        progress = (self.lot_count_label, self.lot_slash_label, self.lot_bar)
+        if loaded and self.lot_size:
+            self.lot_count_label.configure(text=str(count))
+            for widget in progress:
+                widget.grid()
+            share = min(count / self.lot_size, 1.0)
+            if share > 0:
+                self.lot_bar_fill.place(x=0, y=0, relheight=1, relwidth=share)
+            else:
+                self.lot_bar_fill.place_forget()
+        else:
+            for widget in progress:
+                widget.grid_remove()
+
+    def apply_lot_size(self, event=None):
+        """Take the lot size the operator typed, for the open lot and the ones after it."""
+        entry = self.lot_size_entry
+        if self.lot_part is None or str(entry.cget('state')) == 'disabled':
+            return
+        text = entry.get().strip()
+        if text == str(self.lot_size or ""):
+            if event is not None and event.keysym == 'Return':
+                self.root.focus_set()
+            return
+
+        count = self.open_lot['LT_OK_COUNT'] if self.open_lot else 0
+        if not text.isdigit() or int(text) <= 0:
+            problem = "Lot size must be a whole number above 0"
+        elif int(text) <= count:
+            problem = f"Lot size must be more than the {count} cables already in this lot"
+        else:
+            problem = None
+
+        def restore():
+            # Put the size in force back, so the focus-out that follows
+            # finds nothing new to apply
+            entry.delete(0, tk.END)
+            entry.insert(0, str(self.lot_size or ""))
+            self.show_lot_progress()
+
+        # Hand focus back so the next barcode scan does not land in this box
+        self.root.focus_set()
+        if problem:
+            self.safe_update_message(problem, "red")
+            restore()
+            return
+
+        size = int(text)
+        if self.open_lot:
+            try:
+                connection = self.get_database_connection()
+                if not connection:
+                    restore()
+                    return
+                cursor = connection.cursor()
+                cursor.execute("UPDATE TBL_PART_LOT SET LT_LOT_SIZE = %s WHERE ID = %s",
+                               (size, self.open_lot['ID']))
+                connection.commit()
+                cursor.close()
+                connection.close()
+                self.open_lot['LT_LOT_SIZE'] = size
+            except Exception as e:
+                print(f"Error saving lot size: {e}")
+                self.safe_update_message(f"Could not save the lot size: {e}", "red")
+                restore()
+                return
+
+        self.lot_size = size
+        self.log_operator_action("LOT_SIZE_SET", f"Lot size {size} from lot {self.lot_number}")
+        self.safe_update_message(f"Lot size set to {size}", "green")
+        self.show_lot_progress()
+
+    def count_ok_in_lot(self, cursor):
+        """Count the OK cable just saved into the part's open lot, starting one if needed.
+
+        Runs in save_testing_data()'s transaction. A lot that reaches its
+        size closes as FULL, so the next OK cable starts the next lot.
+        """
+        try:
+            now = datetime.now()
+            cursor.execute("""
+                SELECT ID, LT_OK_COUNT, LT_LOT_SIZE, LT_LOT_NUMBER
+                FROM TBL_PART_LOT
+                WHERE LT_PART_NUMBER = %s AND LT_STATUS = 'OPEN'
+                ORDER BY LT_LOT_NUMBER DESC
+                LIMIT 1
+            """, (self.partNumber,))
+            row = cursor.fetchone()
+
+            if row:
+                lot_id, count, size, number = row
+                count += 1
+                cursor.execute("""
+                    UPDATE TBL_PART_LOT
+                    SET LT_OK_COUNT = %s, LT_LAST_TRACE_CODE = %s
+                    WHERE ID = %s
+                """, (count, self.traceabilityCode, lot_id))
+            else:
+                cursor.execute("""
+                    SELECT COALESCE(MAX(LT_LOT_NUMBER), 0) + 1
+                    FROM TBL_PART_LOT
+                    WHERE LT_PART_NUMBER = %s
+                """, (self.partNumber,))
+                number = cursor.fetchone()[0]
+                count, size = 1, self.lot_size
+                cursor.execute("""
+                    INSERT INTO TBL_PART_LOT
+                    (LT_PART_NUMBER, LT_LOT_NUMBER, LT_LOT_SIZE, LT_OK_COUNT,
+                     LT_START_TRACE_CODE, LT_LAST_TRACE_CODE, LT_STATUS, LT_START_DATETIME)
+                    VALUES (%s, %s, %s, 1, %s, %s, 'OPEN', %s)
+                """, (self.partNumber, number, size, self.traceabilityCode,
+                      self.traceabilityCode, now))
+                lot_id = cursor.lastrowid
+
+            if size and count >= size:
+                cursor.execute("""
+                    UPDATE TBL_PART_LOT
+                    SET LT_STATUS = 'FULL', LT_END_DATETIME = %s
+                    WHERE ID = %s
+                """, (now, lot_id))
+                self.trace(f"LOT {number} FULL - {count} OK cables")
+
+        except Exception as e:
+            print(f"Error counting OK cable into lot: {e}")
+
+    def close_partial_lot(self):
+        """Close the part's open lot as PARTIAL now that the part is released."""
+        lot = self.open_lot
+        if self.lot_part is None or not lot:
+            return
+
+        try:
+            connection = self.get_database_connection()
+            if not connection:
+                return
+            cursor = connection.cursor()
+            cursor.execute("""
+                UPDATE TBL_PART_LOT
+                SET LT_STATUS = 'PARTIAL', LT_END_DATETIME = %s
+                WHERE ID = %s AND LT_STATUS = 'OPEN'
+            """, (datetime.now(), lot['ID']))
+            connection.commit()
+            cursor.close()
+            connection.close()
+
+            self.trace(f"LOT {lot['LT_LOT_NUMBER']} PARTIAL - {lot['LT_OK_COUNT']} OK cables")
+            self.log_operator_action(
+                "LOT_PARTIAL",
+                f"Lot {lot['LT_LOT_NUMBER']} closed at {lot['LT_OK_COUNT']} of "
+                f"{lot['LT_LOT_SIZE'] or '-'}, {lot['LT_START_TRACE_CODE']} to "
+                f"{lot['LT_LAST_TRACE_CODE']}")
+        except Exception as e:
+            print(f"Error closing partial lot: {e}")
 
     def load_graph(self):
         """Load today's readings for the current part into the charts."""
@@ -4324,6 +4629,7 @@ class EOLTesterGUI:
             # Update or insert part running serial
             if status == "OK":
                 self.update_part_running_serial(cursor)
+                self.count_ok_in_lot(cursor)
                 connection.commit()
             
             cursor.close()
