@@ -345,11 +345,17 @@ class MainConsole(tk.Tk):
 
     def toggle_nav(self):
         """Put the navigation away, or bring it back, with the tab on its edge."""
-        self.nav_open = not self.nav_open
+        self.set_nav(not self.nav_open)
+
+    def set_nav(self, shown):
+        """Show or put away the navigation, turning its tab's triangle to match."""
+        if shown == self.nav_open:
+            return
+        self.nav_open = shown
         self.nav_tab.configure(image=ui.icon_image(
-            'triangle_left' if self.nav_open else 'triangle_right',
+            'triangle_left' if shown else 'triangle_right',
             ui.TEXT_ON_DARK, 16))
-        self.place_nav(self.nav_open)
+        self.place_nav(shown)
 
     def nav_button(self, nav, icon, label, command, danger=False):
         button = NavButton(nav, icon, label, command, danger=danger)
@@ -580,6 +586,10 @@ class MainConsole(tk.Tk):
 
         self.page_closed_hook = on_closed
         self.mark_current(entry)
+
+        # The navigation lies over the page's left edge, so it is put away
+        # once a page is chosen; its tab brings it back.
+        self.set_nav(False)
         return True
 
     def close_page(self):
