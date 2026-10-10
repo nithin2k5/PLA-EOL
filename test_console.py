@@ -2378,52 +2378,39 @@ class EOLTesterGUI:
             
             station_id = int(config.get('PLC_STATION_ID', '1'))
             
-            # Parse addresses from process status array
-            # Convert hex addresses to decimal
+            # All the coils come back in one request covering the lowest to
+            # the highest address. One request per coil took long enough
+            # that a result coil the PLC holds only briefly could be on and
+            # off again between two reads.
             try:
-                for i, address in enumerate(self.process_addresses):
-                    if not address.strip():
-                        continue
-                    
-                    try:
-                        # Word in decimal, bit in hex: see plc_address.py
-                        addr_num = bit_address(address)
-                        
-                        # Read coil
-                        if address.startswith('M') or address.startswith('X'):
-                            result = self.plc_client.read_coils(addr_num, count=1, device_id=station_id)
-                            
-                            if not result.isError():
-                                status_values[address] = result.bits[0] if result.bits else False
-                                # Update successful read timestamp
-                                self.plc_last_successful_read = time.time()
-                                self.plc_communication_errors = 0  # Reset error counter
-                            else:
-                                # A PLC that fails one read will fail the rest
-                                # too, each after a full timeout. Give up on this
-                                # snapshot rather than hold the line that long.
-                                self.plc_communication_errors += 1
-                                print(f"⚠️ PLC read error for {address}: {result}")
-                                return {}
-                        
-                        # Small delay to prevent overwhelming PLC
-                        time.sleep(0.01)
-                        
-                    except Exception as e:
-                        self.plc_communication_errors += 1
-                        print(f"⚠️ Error reading PLC address {address}: {e}")
-                        return {}
-                
-                # Too many failed reads: this snapshot is not trustworthy
-                if self.plc_communication_errors >= 5:
-                    print("⚠️ Too many PLC communication errors - discarding this read")
+                # Word in decimal, bit in hex: see plc_address.py
+                bits = {address: bit_address(address)
+                        for address in self.process_addresses
+                        if address.strip() and address[0] in 'MX'}
+                if not bits:
                     return {}
-                
+                first = min(bits.values())
+                count = max(bits.values()) - first + 1
+                if count > 2000:
+                    print("⚠️ Process coils span more than one Modbus read - no status read")
+                    return {}
+
+                result = self.plc_client.read_coils(first, count=count, device_id=station_id)
+                if result.isError():
+                    self.plc_communication_errors += 1
+                    print(f"⚠️ PLC read error for process coils: {result}")
+                    return {}
+
+                for address, bit in bits.items():
+                    status_values[address] = bool(result.bits[bit - first])
+                self.plc_last_successful_read = time.time()
+                self.plc_communication_errors = 0
+
             except Exception as e:
                 print(f"Error reading PLC coils: {e}")
                 self.plc_communication_errors += 1
                 return {}
-            
+
             return status_values
                 
         except Exception as e:
