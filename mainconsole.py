@@ -706,7 +706,8 @@ class MainConsole(tk.Tk):
         into that page instead of waiting for the operator to press Test.
         """
         self.archive_old_data()
-        self.test_click()
+        # The navigation stays out over it, so the operator sees it is there
+        self.test_click(hide_nav=False)
 
     def archive_old_data(self):
         """Write records older than the retention window out to both folders."""
@@ -797,12 +798,13 @@ class MainConsole(tk.Tk):
         if self.shell_is_alive():
             self.placeholder.pack(fill="both", expand=True)
 
-    def open_page(self, title, build, on_closed=None, entry=None):
+    def open_page(self, title, build, on_closed=None, entry=None, hide_nav=True):
         """Build one console into the page panel, replacing what is there.
 
         `build` is handed the panel and returns the console instance,
         `on_closed` runs once that page has been torn down again, and
-        `entry` is the rail entry to show as current while it is open.
+        `entry` is the rail entry to show as current while it is open, and
+        `hide_nav` puts the navigation away once the page is up.
         """
         self.close_page()
         self.placeholder.pack_forget()
@@ -833,7 +835,8 @@ class MainConsole(tk.Tk):
 
         # The navigation lies over the page's left edge, so it is put away
         # once a page is chosen; its tab brings it back.
-        self.set_nav(False)
+        if hide_nav:
+            self.set_nav(False)
         return True
 
     def close_page(self):
@@ -934,11 +937,11 @@ class MainConsole(tk.Tk):
 
         self.open_page("Vision Settings", VisionSettings, entry=self.btn_vision)
 
-    def test_click(self):
+    def test_click(self, hide_nav=True):
         self.open_page(
             "Test Console", self.build_test_console,
             on_closed=lambda: self.release_plc_port("after closing the test console"),
-            entry=self.btn_test)
+            entry=self.btn_test, hide_nav=hide_nav)
 
     def build_test_console(self, page):
         # A port left open by an earlier run would refuse to connect.
